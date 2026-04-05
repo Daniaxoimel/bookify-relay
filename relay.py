@@ -1,27 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Bookify Relay Server — postaviti na Google Cloud Run
-Čuva mapiranje: kod_učionice → javni URL profesora
+Bookify Relay Server
+Ucenik salje podatke na relay, profesor cita sa relaya.
 """
-
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import json
-import time
-import os
-import threading
+import json, time, os, threading
 
-# Podaci se čuvaju u memoriji — relay je samo posrednik
-# {kod: {"url": "https://...", "vrijeme": 1234567890}}
+# {classroom_kod: {ucenik_id: {podaci}}}
 sobe = {}
 sobe_lock = threading.Lock()
-
-# Soba ističe ako profesor nije aktivan 2 sata
-ISTICE_ZA = 7200  # sekundi
-
+ISTICE_ZA = 7200  # 2 sata neaktivnosti
 
 class RelayHandler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        pass  # Isključi logove
+    def log_message(self, f, *a): pass
 
     def _json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -40,111 +31,125 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        # Učenik pita: GET /spoji?kod=XK7M9R
-        if self.path.startswith("/spoji"):
-            kod = ""
-            if "?" in self.path:
-                params = self.path.split("?", 1)[1]
-                for p in params.split("&"):
-                    if p.startswith("kod="):
-                        kod = p[4:].strip().upper()
-
+        # Profesor cita listu ucenika: GET /ucenik_lista?kod=S93D4R
+        if self.path.startswith("/ucenik_lista"):
+            kod = self._get_param("kod")
             if not kod:
                 self._json({"greska": "Nedostaje kod"}, 400)
                 return
-
             with sobe_lock:
-                soba = sobe.get(kod)
+                soba = sobe.get(kod, {})
+                # Filtriraj neaktivne
+                aktivni = {uid: u for uid, u in soba.items()
+                           if time.time() - u.get("vrijeme", 0) < ISTICE_ZA}
+            self._json({"ucenici": aktivni})
 
-            if not soba:
-                self._json({"greska": "Kod nije pronađen. Profesor možda nije spojen."}, 404)
+        # Profesor cita zadatak koji je poslao: GET /zadatak?kod=S93D4R
+        elif self.path.startswith("/zadatak"):
+            kod = self._get_param("kod")
+            if not kod:
+                self._json({"tekst": "", "tip": "tekst"})
                 return
-
-            # Provjeri da li je soba istekla
-            if time.time() - soba["vrijeme"] > ISTICE_ZA:
-                with sobe_lock:
-                    sobe.pop(kod, None)
-                self._json({"greska": "Profesor je offline."}, 404)
-                return
-
-            self._json({"url": soba["url"], "kod": kod})
+            with sobe_lock:
+                zadatak = sobe.get(f"zadatak_{kod}", {"tekst": "", "tip": "tekst"})
+            self._json(zadatak)
 
         elif self.path == "/ping":
-            self._json({"status": "ok", "relay": "Bookify Relay v1.0"})
+            self._json({"status": "ok", "relay": "Bookify Relay v2.0"})
 
         elif self.path == "/status":
             with sobe_lock:
-                aktivne = len(sobe)
-            self._json({"aktivne_sobe": aktivne})
+                ukupno = sum(len(v) for k, v in sobe.items() if not k.startswith("zadatak_"))
+            self._json({"spojeni": ukupno})
 
         else:
             self._json({"greska": "Not found"}, 404)
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length)
         try:
-            data = json.loads(body.decode("utf-8"))
+            data = json.loads(self.rfile.read(length).decode("utf-8"))
         except Exception:
             self._json({"greska": "Neispravan JSON"}, 400)
             return
 
-        # Profesor registruje: POST /registruj {"kod": "XK7M9R", "url": "https://..."}
-        if self.path == "/registruj":
-            kod = data.get("kod", "").strip().upper()
-            url = data.get("url", "").strip()
-
-            if not kod or not url:
-                self._json({"greska": "Nedostaju kod ili url"}, 400)
+        # Ucenik salje podatke: POST /update
+        if self.path == "/update":
+            kod = data.get("classroom_kod", "").strip().upper()
+            ucenik_id = data.get("ucenik_id", "").strip()
+            if not kod or not ucenik_id:
+                self._json({"greska": "Nedostaje kod ili ucenik_id"}, 400)
                 return
-
             with sobe_lock:
-                sobe[kod] = {
-                    "url": url,
-                    "vrijeme": time.time()
+                if kod not in sobe:
+                    sobe[kod] = {}
+                sobe[kod][ucenik_id] = {
+                    "ime":           data.get("ime", "Nepoznat"),
+                    "razred":        data.get("razred", ""),
+                    "promet_dug":    data.get("promet_dug", 0),
+                    "promet_pot":    data.get("promet_pot", 0),
+                    "zavrsio":       data.get("zavrsio", False),
+                    "zadnji_update": data.get("zadnji_update", ""),
+                    "state":         data.get("state", {}),
+                    "ip":            ucenik_id,
+                    "vrijeme":       time.time(),
                 }
+                # Vrati zadatak za ovaj kod
+                zadatak = sobe.get(f"zadatak_{kod}", {"tekst": "", "tip": "tekst"})
+                # Vrati oznake za ovog ucenika
+                oznake = sobe.get(f"oznake_{kod}_{ucenik_id}", [])
+            self._json({"status": "ok", "zadatak": zadatak, "oznake": oznake})
 
-            self._json({"status": "ok", "kod": kod, "url": url})
-
-        # Profesor osvježava (heartbeat da ne istekne)
-        elif self.path == "/heartbeat":
-            kod = data.get("kod", "").strip().upper()
-            if kod and kod in sobe:
-                with sobe_lock:
-                    if kod in sobe:
-                        sobe[kod]["vrijeme"] = time.time()
-                self._json({"status": "ok"})
-            else:
-                self._json({"greska": "Kod nije registrovan"}, 404)
-
-        # Profesor se odjavljuje
-        elif self.path == "/odjava":
-            kod = data.get("kod", "").strip().upper()
+        # Profesor salje zadatak: POST /posalji_zadatak
+        elif self.path == "/posalji_zadatak":
+            kod = data.get("classroom_kod", "").strip().upper()
+            tekst = data.get("tekst", "")
+            tip = data.get("tip", "tekst")
+            if not kod:
+                self._json({"greska": "Nedostaje kod"}, 400)
+                return
             with sobe_lock:
-                sobe.pop(kod, None)
+                sobe[f"zadatak_{kod}"] = {"tekst": tekst, "tip": tip}
+            self._json({"status": "ok"})
+
+        # Profesor salje oznake: POST /posalji_oznake
+        elif self.path == "/posalji_oznake":
+            kod = data.get("classroom_kod", "").strip().upper()
+            ucenik_id = data.get("ucenik_id", "").strip()
+            oznake = data.get("oznake", [])
+            if not kod or not ucenik_id:
+                self._json({"greska": "Nedostaje kod ili ucenik_id"}, 400)
+                return
+            with sobe_lock:
+                sobe[f"oznake_{kod}_{ucenik_id}"] = oznake
             self._json({"status": "ok"})
 
         else:
             self._json({"greska": "Not found"}, 404)
 
+    def _get_param(self, name):
+        if "?" not in self.path:
+            return ""
+        for p in self.path.split("?", 1)[1].split("&"):
+            if p.startswith(f"{name}="):
+                return p[len(name)+1:].strip().upper()
+        return ""
 
-def cisti_stare_sobe():
-    """Briše istekle sobe svakih 10 minuta."""
+
+def _cisti():
     while True:
         time.sleep(600)
         with sobe_lock:
-            istekli = [k for k, v in sobe.items()
-                       if time.time() - v["vrijeme"] > ISTICE_ZA]
-            for k in istekli:
-                del sobe[k]
+            for kod in list(sobe.keys()):
+                if kod.startswith("zadatak_") or kod.startswith("oznake_"):
+                    continue
+                for uid in list(sobe[kod].keys()):
+                    if time.time() - sobe[kod][uid].get("vrijeme", 0) > ISTICE_ZA:
+                        del sobe[kod][uid]
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-
-    t = threading.Thread(target=cisti_stare_sobe, daemon=True)
-    t.start()
-
-    print(f"Bookify Relay pokrenut na portu {port}")
-    server = HTTPServer(("0.0.0.0", port), RelayHandler)
-    server.serve_forever()
+    threading.Thread(target=_cisti, daemon=True).start()
+    print(f"Bookify Relay v2.0 pokrenut na portu {port}")
+    HTTPServer(("0.0.0.0", port), RelayHandler).serve_forever()
