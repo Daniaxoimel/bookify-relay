@@ -89,6 +89,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "promet_dug":    data.get("promet_dug", 0),
                     "promet_pot":    data.get("promet_pot", 0),
                     "zavrsio":       data.get("zavrsio", False),
+                    "broj_gresaka":  data.get("broj_gresaka", 0),
                     "zadnji_update": data.get("zadnji_update", ""),
                     "state":         data.get("state", {}),
                     "ip":            ucenik_id,
