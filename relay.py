@@ -112,10 +112,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                 return
             with sobe_lock:
                 if ucenik_id:
-                    # Individualni zadatak za konkretnog ucenika
-                    sobe[f"zadatak_{kod}_{ucenik_id}"] = {"tekst": tekst, "tip": tip}
+                    kljuc = f"zadatak_{kod}_{ucenik_id}"
+                    if tekst:
+                        sobe[kljuc] = {"tekst": tekst, "tip": tip}
+                    else:
+                        sobe.pop(kljuc, None)  # Obriši — globalni dobija prednost
                 else:
-                    # Globalni zadatak za sve
                     sobe[f"zadatak_{kod}"] = {"tekst": tekst, "tip": tip}
             self._json({"status": "ok"})
 
