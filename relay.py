@@ -95,8 +95,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "ip":            ucenik_id,
                     "vrijeme":       time.time(),
                 }
-                # Vrati zadatak za ovaj kod
-                zadatak = sobe.get(f"zadatak_{kod}", {"tekst": "", "tip": "tekst"})
+                # Individualni zadatak ima prednost nad globalnim
+                zadatak = sobe.get(f"zadatak_{kod}_{ucenik_id}") or sobe.get(f"zadatak_{kod}", {"tekst": "", "tip": "tekst"})
                 # Vrati oznake za ovog ucenika
                 oznake = sobe.get(f"oznake_{kod}_{ucenik_id}", [])
             self._json({"status": "ok", "zadatak": zadatak, "oznake": oznake})
@@ -106,11 +106,17 @@ class RelayHandler(BaseHTTPRequestHandler):
             kod = data.get("classroom_kod", "").strip().upper()
             tekst = data.get("tekst", "")
             tip = data.get("tip", "tekst")
+            ucenik_id = data.get("ucenik_id", "").strip()
             if not kod:
                 self._json({"greska": "Nedostaje kod"}, 400)
                 return
             with sobe_lock:
-                sobe[f"zadatak_{kod}"] = {"tekst": tekst, "tip": tip}
+                if ucenik_id:
+                    # Individualni zadatak za konkretnog ucenika
+                    sobe[f"zadatak_{kod}_{ucenik_id}"] = {"tekst": tekst, "tip": tip}
+                else:
+                    # Globalni zadatak za sve
+                    sobe[f"zadatak_{kod}"] = {"tekst": tekst, "tip": tip}
             self._json({"status": "ok"})
 
         # Profesor salje oznake: POST /posalji_oznake
