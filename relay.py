@@ -1,18 +1,70 @@
 # -*- coding: utf-8 -*-
 """
-Bookify Relay Server
+Bookify Relay Server v3.0
 Ucenik salje podatke na relay, profesor cita sa relaya.
-"""
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import json, time, os, threading
 
-# {classroom_kod: {ucenik_id: {podaci}}}
+Promjene u odnosu na v2.0:
+- Razdvojene strukture za sobe/zadatke/oznake (umjesto miješanja u jednom dict-u
+  preko string-prefiksa) -> lakše za čitanje i bez bug-a u /status.
+- Zadaci i oznake sada imaju svoj timestamp i čiste se zajedno sa sobom
+  (prije su se gomilali zauvijek u memoriji).
+- ThreadingHTTPServer -> paralelno opsluzuje vise ucenika/profesora odjednom.
+- Query parametri se parsiraju preko urllib.parse (robusnije od rucnog splita).
+- Periodično čuvanje stanja u JSON fajl na disku, ucitavanje pri pokretanju
+  -> podaci preživljavaju restart/redeploy (npr. Render free tier).
+"""
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+import json, time, os, threading, signal, sys
+
+ISTICE_ZA = 7200        # 2 sata neaktivnosti -> soba/zadatak/oznaka istice
+CISTI_SVAKIH = 600      # interval čišćenja (sekunde)
+SNAPSHOT_SVAKIH = 30    # interval čuvanja na disk (sekunde)
+SNAPSHOT_FILE = os.environ.get("RELAY_SNAPSHOT", "relay_state.json")
+
+# sobe:   {kod: {ucenik_id: {podaci..., "vrijeme": ts}}}
+# zadaci: {(kod, ucenik_id_ili_None): {"tekst":.., "tip":.., "vrijeme": ts}}
+# oznake: {(kod, ucenik_id): {"lista": [...], "vrijeme": ts}}
 sobe = {}
-sobe_lock = threading.Lock()
-ISTICE_ZA = 7200  # 2 sata neaktivnosti
+zadaci = {}
+oznake = {}
+lock = threading.Lock()
+
+
+def _kljuc_zadatka(kod, ucenik_id=None):
+    return f"{kod}|{ucenik_id or ''}"
+
+
+def _snapshot_ucitaj():
+    if not os.path.exists(SNAPSHOT_FILE):
+        return
+    try:
+        with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        with lock:
+            sobe.update(data.get("sobe", {}))
+            zadaci.update(data.get("zadaci", {}))
+            oznake.update(data.get("oznake", {}))
+        print(f"Učitano stanje iz {SNAPSHOT_FILE}")
+    except Exception as e:
+        print(f"Nije moguće učitati snapshot: {e}")
+
+
+def _snapshot_sacuvaj():
+    with lock:
+        data = {"sobe": sobe, "zadaci": zadaci, "oznake": oznake}
+    tmp = SNAPSHOT_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, SNAPSHOT_FILE)
+    except Exception as e:
+        print(f"Nije moguće sačuvati snapshot: {e}")
+
 
 class RelayHandler(BaseHTTPRequestHandler):
-    def log_message(self, f, *a): pass
+    def log_message(self, f, *a):
+        pass
 
     def _json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -21,7 +73,10 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # klijent je otisao prije nego smo stigli odgovoriti
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -31,59 +86,60 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        # Profesor cita listu ucenika: GET /ucenik_lista?kod=S93D4R
-        if self.path.startswith("/ucenik_lista"):
-            kod = self._get_param("kod")
+        parsed = urlparse(self.path)
+        path = parsed.path
+        params = parse_qs(parsed.query)
+        kod = (params.get("kod", [""])[0] or "").strip().upper()
+
+        if path == "/ucenik_lista":
             if not kod:
                 self._json({"greska": "Nedostaje kod"}, 400)
                 return
-            with sobe_lock:
+            with lock:
                 soba = sobe.get(kod, {})
-                # Filtriraj neaktivne
                 aktivni = {uid: u for uid, u in soba.items()
                            if time.time() - u.get("vrijeme", 0) < ISTICE_ZA}
             self._json({"ucenici": aktivni})
 
-        # Profesor cita zadatak koji je poslao: GET /zadatak?kod=S93D4R
-        elif self.path.startswith("/zadatak"):
-            kod = self._get_param("kod")
+        elif path == "/zadatak":
             if not kod:
                 self._json({"tekst": "", "tip": "tekst"})
                 return
-            with sobe_lock:
-                zadatak = sobe.get(f"zadatak_{kod}", {"tekst": "", "tip": "tekst"})
-            self._json(zadatak)
+            with lock:
+                z = zadaci.get(_kljuc_zadatka(kod), {"tekst": "", "tip": "tekst"})
+            self._json({"tekst": z.get("tekst", ""), "tip": z.get("tip", "tekst")})
 
-        elif self.path == "/ping":
-            self._json({"status": "ok", "relay": "Bookify Relay v2.0"})
+        elif path == "/ping":
+            self._json({"status": "ok", "relay": "Bookify Relay v3.0"})
 
-        elif self.path == "/status":
-            with sobe_lock:
-                ukupno = sum(len(v) for k, v in sobe.items() if not k.startswith("zadatak_"))
+        elif path == "/status":
+            with lock:
+                ukupno = sum(len(v) for v in sobe.values())
             self._json({"spojeni": ukupno})
 
         else:
             self._json({"greska": "Not found"}, 404)
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
+        length = int(self.headers.get("Content-Length", 0) or 0)
         try:
-            data = json.loads(self.rfile.read(length).decode("utf-8"))
+            sirovo = self.rfile.read(length).decode("utf-8") if length else "{}"
+            data = json.loads(sirovo)
         except Exception:
             self._json({"greska": "Neispravan JSON"}, 400)
             return
 
+        path = urlparse(self.path).path
+
         # Ucenik salje podatke: POST /update
-        if self.path == "/update":
-            kod = data.get("classroom_kod", "").strip().upper()
-            ucenik_id = data.get("ucenik_id", "").strip()
+        if path == "/update":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            ucenik_id = str(data.get("ucenik_id", "")).strip()
             if not kod or not ucenik_id:
                 self._json({"greska": "Nedostaje kod ili ucenik_id"}, 400)
                 return
-            with sobe_lock:
-                if kod not in sobe:
-                    sobe[kod] = {}
-                sobe[kod][ucenik_id] = {
+            with lock:
+                sobe.setdefault(kod, {})[ucenik_id] = {
                     "ime":           data.get("ime", "Nepoznat"),
                     "razred":        data.get("razred", ""),
                     "promet_dug":    data.get("promet_dug", 0),
@@ -96,69 +152,94 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "vrijeme":       time.time(),
                 }
                 # Individualni zadatak ima prednost nad globalnim
-                zadatak = sobe.get(f"zadatak_{kod}_{ucenik_id}") or sobe.get(f"zadatak_{kod}", {"tekst": "", "tip": "tekst"})
-                # Vrati oznake za ovog ucenika
-                oznake = sobe.get(f"oznake_{kod}_{ucenik_id}", [])
-            self._json({"status": "ok", "zadatak": zadatak, "oznake": oznake})
+                z = zadaci.get(_kljuc_zadatka(kod, ucenik_id)) or \
+                    zadaci.get(_kljuc_zadatka(kod)) or \
+                    {"tekst": "", "tip": "tekst"}
+                zadatak = {"tekst": z.get("tekst", ""), "tip": z.get("tip", "tekst")}
+                o = oznake.get(f"{kod}|{ucenik_id}")
+                lista_oznaka = o.get("lista", []) if o else []
+            self._json({"status": "ok", "zadatak": zadatak, "oznake": lista_oznaka})
 
         # Profesor salje zadatak: POST /posalji_zadatak
-        elif self.path == "/posalji_zadatak":
-            kod = data.get("classroom_kod", "").strip().upper()
+        elif path == "/posalji_zadatak":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
             tekst = data.get("tekst", "")
             tip = data.get("tip", "tekst")
-            ucenik_id = data.get("ucenik_id", "").strip()
+            ucenik_id = str(data.get("ucenik_id", "")).strip()
             if not kod:
                 self._json({"greska": "Nedostaje kod"}, 400)
                 return
-            with sobe_lock:
-                if ucenik_id:
-                    kljuc = f"zadatak_{kod}_{ucenik_id}"
-                    if tekst:
-                        sobe[kljuc] = {"tekst": tekst, "tip": tip}
-                    else:
-                        sobe.pop(kljuc, None)  # Obriši — globalni dobija prednost
+            with lock:
+                kljuc = _kljuc_zadatka(kod, ucenik_id if ucenik_id else None)
+                if tekst:
+                    zadaci[kljuc] = {"tekst": tekst, "tip": tip, "vrijeme": time.time()}
                 else:
-                    sobe[f"zadatak_{kod}"] = {"tekst": tekst, "tip": tip}
+                    zadaci.pop(kljuc, None)  # Obriši — globalni (ako postoji) dobija prednost
             self._json({"status": "ok"})
 
         # Profesor salje oznake: POST /posalji_oznake
-        elif self.path == "/posalji_oznake":
-            kod = data.get("classroom_kod", "").strip().upper()
-            ucenik_id = data.get("ucenik_id", "").strip()
-            oznake = data.get("oznake", [])
+        elif path == "/posalji_oznake":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            ucenik_id = str(data.get("ucenik_id", "")).strip()
+            lista = data.get("oznake", [])
             if not kod or not ucenik_id:
                 self._json({"greska": "Nedostaje kod ili ucenik_id"}, 400)
                 return
-            with sobe_lock:
-                sobe[f"oznake_{kod}_{ucenik_id}"] = oznake
+            with lock:
+                oznake[f"{kod}|{ucenik_id}"] = {"lista": lista, "vrijeme": time.time()}
             self._json({"status": "ok"})
 
         else:
             self._json({"greska": "Not found"}, 404)
 
-    def _get_param(self, name):
-        if "?" not in self.path:
-            return ""
-        for p in self.path.split("?", 1)[1].split("&"):
-            if p.startswith(f"{name}="):
-                return p[len(name)+1:].strip().upper()
-        return ""
-
 
 def _cisti():
     while True:
-        time.sleep(600)
-        with sobe_lock:
+        time.sleep(CISTI_SVAKIH)
+        sada = time.time()
+        with lock:
+            # Neaktivni ucenici
             for kod in list(sobe.keys()):
-                if kod.startswith("zadatak_") or kod.startswith("oznake_"):
-                    continue
                 for uid in list(sobe[kod].keys()):
-                    if time.time() - sobe[kod][uid].get("vrijeme", 0) > ISTICE_ZA:
+                    if sada - sobe[kod][uid].get("vrijeme", 0) > ISTICE_ZA:
                         del sobe[kod][uid]
+                if not sobe[kod]:
+                    del sobe[kod]
+
+            # Istekli zadaci
+            for kljuc in list(zadaci.keys()):
+                if sada - zadaci[kljuc].get("vrijeme", 0) > ISTICE_ZA:
+                    del zadaci[kljuc]
+
+            # Istekle oznake
+            for kljuc in list(oznake.keys()):
+                if sada - oznake[kljuc].get("vrijeme", 0) > ISTICE_ZA:
+                    del oznake[kljuc]
+
+
+def _snapshotuj_periodicno():
+    while True:
+        time.sleep(SNAPSHOT_SVAKIH)
+        _snapshot_sacuvaj()
+
+
+def _na_gasenje(signum, frame):
+    # Render i slicni hosting servisi salju SIGTERM (ne SIGINT) pri gasenju/redeployu,
+    # pa moramo sacuvati snapshot i tu, ne samo na KeyboardInterrupt.
+    _snapshot_sacuvaj()
+    sys.exit(0)
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
+    _snapshot_ucitaj()
+    signal.signal(signal.SIGTERM, _na_gasenje)
     threading.Thread(target=_cisti, daemon=True).start()
-    print(f"Bookify Relay v2.0 pokrenut na portu {port}")
-    HTTPServer(("0.0.0.0", port), RelayHandler).serve_forever()
+    threading.Thread(target=_snapshotuj_periodicno, daemon=True).start()
+    print(f"Bookify Relay v3.0 pokrenut na portu {port}")
+    try:
+        ThreadingHTTPServer(("0.0.0.0", port), RelayHandler).serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _snapshot_sacuvaj()
