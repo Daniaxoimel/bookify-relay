@@ -22,12 +22,14 @@ CISTI_SVAKIH = 600      # interval čišćenja (sekunde)
 SNAPSHOT_SVAKIH = 30    # interval čuvanja na disk (sekunde)
 SNAPSHOT_FILE = os.environ.get("RELAY_SNAPSHOT", "relay_state.json")
 
-# sobe:   {kod: {ucenik_id: {podaci..., "vrijeme": ts}}}
-# zadaci: {(kod, ucenik_id_ili_None): {"tekst":.., "tip":.., "vrijeme": ts}}
-# oznake: {(kod, ucenik_id): {"lista": [...], "vrijeme": ts}}
+# sobe:    {kod: {ucenik_id: {podaci..., "vrijeme": ts}}}
+# zadaci:  {(kod, ucenik_id_ili_None): {"tekst":.., "tip":.., "vrijeme": ts}}
+# oznake:  {(kod, ucenik_id): {"lista": [...], "vrijeme": ts}}  — profesor -> ucenik (greske)
+# signali: {kod: {ucenik_id: [ {rb_bloka, konto, opis, vrijeme}, ... ]}}  — ucenik -> profesor ("nisam siguran")
 sobe = {}
 zadaci = {}
 oznake = {}
+signali = {}
 lock = threading.Lock()
 
 
@@ -45,6 +47,7 @@ def _snapshot_ucitaj():
             sobe.update(data.get("sobe", {}))
             zadaci.update(data.get("zadaci", {}))
             oznake.update(data.get("oznake", {}))
+            signali.update(data.get("signali", {}))
         print(f"Učitano stanje iz {SNAPSHOT_FILE}")
     except Exception as e:
         print(f"Nije moguće učitati snapshot: {e}")
@@ -52,7 +55,7 @@ def _snapshot_ucitaj():
 
 def _snapshot_sacuvaj():
     with lock:
-        data = {"sobe": sobe, "zadaci": zadaci, "oznake": oznake}
+        data = {"sobe": sobe, "zadaci": zadaci, "oznake": oznake, "signali": signali}
     tmp = SNAPSHOT_FILE + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -97,8 +100,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                 return
             with lock:
                 soba = sobe.get(kod, {})
-                aktivni = {uid: u for uid, u in soba.items()
-                           if time.time() - u.get("vrijeme", 0) < ISTICE_ZA}
+                aktivni = {}
+                for uid, u in soba.items():
+                    if time.time() - u.get("vrijeme", 0) < ISTICE_ZA:
+                        u2 = dict(u)
+                        u2["signali"] = signali.get(kod, {}).get(uid, [])
+                        aktivni[uid] = u2
             self._json({"ucenici": aktivni})
 
         elif path == "/zadatak":
@@ -189,6 +196,35 @@ class RelayHandler(BaseHTTPRequestHandler):
                 oznake[f"{kod}|{ucenik_id}"] = {"lista": lista, "vrijeme": time.time()}
             self._json({"status": "ok"})
 
+        # Ucenik salje signal profesoru ("nisam siguran u ovaj red"): POST /posalji_signal
+        elif path == "/posalji_signal":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            ucenik_id = str(data.get("ucenik_id", "")).strip()
+            if not kod or not ucenik_id:
+                self._json({"greska": "Nedostaje kod ili ucenik_id"}, 400)
+                return
+            unos = {
+                "rb_bloka": data.get("rb_bloka", ""),
+                "konto":    data.get("konto", ""),
+                "opis":     data.get("opis", ""),
+                "vrijeme":  time.time(),
+            }
+            with lock:
+                signali.setdefault(kod, {}).setdefault(ucenik_id, []).append(unos)
+            self._json({"status": "ok"})
+
+        # Profesor potvrdjuje da je pregledao signale ucenika: POST /procitaj_signale
+        elif path == "/procitaj_signale":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            ucenik_id = str(data.get("ucenik_id", "")).strip()
+            if not kod or not ucenik_id:
+                self._json({"greska": "Nedostaje kod ili ucenik_id"}, 400)
+                return
+            with lock:
+                if kod in signali:
+                    signali[kod].pop(ucenik_id, None)
+            self._json({"status": "ok"})
+
         else:
             self._json({"greska": "Not found"}, 404)
 
@@ -215,6 +251,14 @@ def _cisti():
             for kljuc in list(oznake.keys()):
                 if sada - oznake[kljuc].get("vrijeme", 0) > ISTICE_ZA:
                     del oznake[kljuc]
+
+            # Signali ucenika ciji ucenik vise nije u sobi (odjavio se/istekao)
+            for kod in list(signali.keys()):
+                for uid in list(signali[kod].keys()):
+                    if kod not in sobe or uid not in sobe[kod]:
+                        del signali[kod][uid]
+                if not signali[kod]:
+                    del signali[kod]
 
 
 def _snapshotuj_periodicno():
