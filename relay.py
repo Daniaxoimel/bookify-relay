@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Bookify Relay Server v3.0
+Bookify Relay Server v3.1
 Ucenik salje podatke na relay, profesor cita sa relaya.
+
+Promjene u odnosu na v3.0:
+- Dodata TRAJNA baza (SQLite, relay_podaci.db) za formativno praćenje:
+  radovi/rezultati učenika se čuvaju zauvijek (ne ističu kao ostalo stanje).
+  Novi endpointi: POST /sacuvaj_trajno, GET /istorija, GET /istorija_detalji,
+  GET /statistika.
 
 Promjene u odnosu na v2.0:
 - Razdvojene strukture za sobe/zadatke/oznake (umjesto miješanja u jednom dict-u
@@ -15,12 +21,17 @@ Promjene u odnosu na v2.0:
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
-import json, time, os, threading, signal, sys
+import json, time, os, threading, signal, sys, sqlite3
+from datetime import datetime
 
 ISTICE_ZA = 7200        # 2 sata neaktivnosti -> soba/zadatak/oznaka istice
 CISTI_SVAKIH = 600      # interval čišćenja (sekunde)
 SNAPSHOT_SVAKIH = 30    # interval čuvanja na disk (sekunde)
 SNAPSHOT_FILE = os.environ.get("RELAY_SNAPSHOT", "relay_state.json")
+
+# Trajna baza (radovi/rezultati učenika) — odvojena od gornjeg efemernog stanja.
+# Isti disk kao i SNAPSHOT_FILE (npr. Render persistent disk), pa preživljava restart.
+DB_FILE = os.environ.get("RELAY_DB", "relay_podaci.db")
 
 # sobe:    {kod: {ucenik_id: {podaci..., "vrijeme": ts}}}
 # zadaci:  {(kod, ucenik_id_ili_None): {"tekst":.., "tip":.., "vrijeme": ts}}
@@ -63,6 +74,117 @@ def _snapshot_sacuvaj():
         os.replace(tmp, SNAPSHOT_FILE)
     except Exception as e:
         print(f"Nije moguće sačuvati snapshot: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# TRAJNA BAZA — radovi/rezultati učenika (za formativno praćenje)
+# ─────────────────────────────────────────────────────────────────────────
+# Odvojeno od efemernog "sobe/zadaci/oznake" stanja iznad, koje ističe nakon
+# ISTICE_ZA sekundi neaktivnosti. Ovo je trajni zapis: svaki put kad učenik
+# klikne "Sačuvaj rad" (ili kad profesor eksplicitno snimi njegov rad), radi
+# se INSERT reda ovdje — ništa se ne briše niti prepisuje, pa se kroz vrijeme
+# gradi istorija za praćenje napretka.
+
+_db_lock = threading.Lock()
+
+
+def _db_konekcija():
+    konn = sqlite3.connect(DB_FILE, timeout=10)
+    konn.execute("PRAGMA journal_mode=WAL")  # bolje podnosi paralelne upise
+    return konn
+
+
+def _db_init():
+    with _db_lock, _db_konekcija() as konn:
+        konn.execute("""
+            CREATE TABLE IF NOT EXISTS radovi (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                kod           TEXT NOT NULL,
+                ucenik_ime    TEXT NOT NULL,
+                razred        TEXT,
+                vrijeme       TEXT NOT NULL,
+                promet_dug    REAL DEFAULT 0,
+                promet_pot    REAL DEFAULT 0,
+                broj_gresaka  INTEGER DEFAULT 0,
+                zavrsio       INTEGER DEFAULT 0,
+                podaci        TEXT NOT NULL
+            )
+        """)
+        konn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_radovi_kod_ucenik
+            ON radovi (kod, ucenik_ime)
+        """)
+
+
+def _db_sacuvaj_rad(kod, ucenik_ime, razred, promet_dug, promet_pot,
+                     broj_gresaka, zavrsio, podaci_dict):
+    vrijeme = datetime.now().isoformat(timespec="seconds")
+    podaci_json = json.dumps(podaci_dict, ensure_ascii=False)
+    with _db_lock, _db_konekcija() as konn:
+        cur = konn.execute("""
+            INSERT INTO radovi (kod, ucenik_ime, razred, vrijeme, promet_dug,
+                                 promet_pot, broj_gresaka, zavrsio, podaci)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (kod, ucenik_ime, razred, vrijeme, promet_dug or 0, promet_pot or 0,
+              broj_gresaka or 0, 1 if zavrsio else 0, podaci_json))
+        return cur.lastrowid
+
+
+def _db_istorija(kod, ucenik_ime=None):
+    with _db_lock, _db_konekcija() as konn:
+        konn.row_factory = sqlite3.Row
+        if ucenik_ime:
+            redovi = konn.execute("""
+                SELECT id, kod, ucenik_ime, razred, vrijeme, promet_dug,
+                       promet_pot, broj_gresaka, zavrsio
+                FROM radovi WHERE kod = ? AND ucenik_ime = ?
+                ORDER BY vrijeme DESC
+            """, (kod, ucenik_ime)).fetchall()
+        else:
+            redovi = konn.execute("""
+                SELECT id, kod, ucenik_ime, razred, vrijeme, promet_dug,
+                       promet_pot, broj_gresaka, zavrsio
+                FROM radovi WHERE kod = ?
+                ORDER BY vrijeme DESC
+            """, (kod,)).fetchall()
+        return [dict(r) for r in redovi]
+
+
+def _db_detalji(rad_id):
+    with _db_lock, _db_konekcija() as konn:
+        konn.row_factory = sqlite3.Row
+        red = konn.execute("SELECT * FROM radovi WHERE id = ?", (rad_id,)).fetchone()
+        if not red:
+            return None
+        d = dict(red)
+        try:
+            d["podaci"] = json.loads(d["podaci"])
+        except Exception:
+            pass
+        return d
+
+
+def _db_statistika(kod):
+    with _db_lock, _db_konekcija() as konn:
+        konn.row_factory = sqlite3.Row
+        ukupno = konn.execute(
+            "SELECT COUNT(*) AS n FROM radovi WHERE kod = ?", (kod,)
+        ).fetchone()["n"]
+        po_ucenika = konn.execute("""
+            SELECT ucenik_ime,
+                   COUNT(*)              AS broj_radova,
+                   AVG(broj_gresaka)     AS prosjek_gresaka,
+                   MAX(vrijeme)          AS poslednji_put,
+                   SUM(zavrsio)          AS broj_zavrsenih
+            FROM radovi WHERE kod = ?
+            GROUP BY ucenik_ime
+            ORDER BY poslednji_put DESC
+        """, (kod,)).fetchall()
+        return {
+            "kod": kod,
+            "ukupno_radova": ukupno,
+            "po_ucenika": [dict(r) for r in po_ucenika],
+        }
 
 
 class RelayHandler(BaseHTTPRequestHandler):
@@ -123,6 +245,45 @@ class RelayHandler(BaseHTTPRequestHandler):
             with lock:
                 ukupno = sum(len(v) for v in sobe.values())
             self._json({"spojeni": ukupno})
+
+        # Trajna istorija radova za jedan kod učionice (svi učenici, ili
+        # samo jedan ako je zadan ucenik_ime) — za formativno praćenje.
+        elif path == "/istorija":
+            if not kod:
+                self._json({"greska": "Nedostaje kod"}, 400)
+                return
+            ucenik_ime = (params.get("ucenik_ime", [""])[0] or "").strip()
+            try:
+                redovi = _db_istorija(kod, ucenik_ime or None)
+                self._json({"radovi": redovi})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
+        # Puni sadržaj jednog sačuvanog rada (za pregled/učitavanje kod profesora)
+        elif path == "/istorija_detalji":
+            rad_id = params.get("id", [""])[0]
+            if not rad_id:
+                self._json({"greska": "Nedostaje id"}, 400)
+                return
+            try:
+                detalji = _db_detalji(int(rad_id))
+                if detalji is None:
+                    self._json({"greska": "Rad nije pronađen"}, 404)
+                else:
+                    self._json({"rad": detalji})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
+        # Agregirana statistika po učionici (broj radova, prosjek grešaka po
+        # učeniku, itd.) — za formativno praćenje napretka kroz vrijeme.
+        elif path == "/statistika":
+            if not kod:
+                self._json({"greska": "Nedostaje kod"}, 400)
+                return
+            try:
+                self._json(_db_statistika(kod))
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
 
         else:
             self._json({"greska": "Not found"}, 404)
@@ -213,6 +374,30 @@ class RelayHandler(BaseHTTPRequestHandler):
                 signali.setdefault(kod, {}).setdefault(ucenik_id, []).append(unos)
             self._json({"status": "ok"})
 
+        # Ucenik trajno cuva svoj rad (za formativno pracenje): POST /sacuvaj_trajno
+        # Za razliku od /update (efemerno, briše se nakon ISTICE_ZA), ovo se
+        # NIKAD ne briše — svaki poziv dodaje novi red u istoriju.
+        elif path == "/sacuvaj_trajno":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            ucenik_ime = str(data.get("ucenik_ime", "")).strip()
+            if not kod or not ucenik_ime:
+                self._json({"greska": "Nedostaje kod ili ucenik_ime"}, 400)
+                return
+            try:
+                novi_id = _db_sacuvaj_rad(
+                    kod=kod,
+                    ucenik_ime=ucenik_ime,
+                    razred=data.get("razred", ""),
+                    promet_dug=data.get("promet_dug", 0),
+                    promet_pot=data.get("promet_pot", 0),
+                    broj_gresaka=data.get("broj_gresaka", 0),
+                    zavrsio=data.get("zavrsio", False),
+                    podaci_dict=data.get("podaci", {}),
+                )
+                self._json({"status": "ok", "id": novi_id})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
         # Profesor potvrdjuje da je pregledao signale ucenika: POST /procitaj_signale
         elif path == "/procitaj_signale":
             kod = str(data.get("classroom_kod", "")).strip().upper()
@@ -276,6 +461,7 @@ def _na_gasenje(signum, frame):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
+    _db_init()
     _snapshot_ucitaj()
     signal.signal(signal.SIGTERM, _na_gasenje)
     threading.Thread(target=_cisti, daemon=True).start()
