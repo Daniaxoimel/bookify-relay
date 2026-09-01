@@ -21,7 +21,7 @@ Promjene u odnosu na v2.0:
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
-import json, time, os, threading, signal, sys, sqlite3
+import json, time, os, threading, signal, sys, sqlite3, hashlib
 from datetime import datetime
 
 ISTICE_ZA = 7200        # 2 sata neaktivnosti -> soba/zadatak/oznaka istice
@@ -114,6 +114,72 @@ def _db_init():
             CREATE INDEX IF NOT EXISTS idx_radovi_kod_ucenik
             ON radovi (kod, ucenik_ime)
         """)
+        # Grad/škola/šifra po kodu učionice — za organizaciju istorije/statistike
+        # (Grad → Škola → Razred → Učenici) i za zaštitu brisanja podataka.
+        konn.execute("""
+            CREATE TABLE IF NOT EXISTS ucionice (
+                kod         TEXT PRIMARY KEY,
+                grad        TEXT DEFAULT '',
+                skola       TEXT DEFAULT '',
+                sifra_hash  TEXT DEFAULT '',
+                azurirano   TEXT
+            )
+        """)
+        # Migracija — ako je tabela ucionice napravljena prije uvođenja šifre.
+        try:
+            konn.execute("ALTER TABLE ucionice ADD COLUMN sifra_hash TEXT DEFAULT ''")
+        except Exception:
+            pass  # kolona već postoji
+
+
+def _upisi_hash(kod, sifra):
+    return hashlib.sha256(f"{kod}:{sifra or ''}".encode("utf-8")).hexdigest()
+
+
+def _provjeri_sifru(kod, sifra):
+    """Vraća True samo ako je šifra tačna. Ako šifra još nije postavljena za
+    ovaj kod, brisanje se odbija (mora se prvo postaviti šifra u profesorskom
+    panelu — Grad/Škola)."""
+    with _db_lock, _db_konekcija() as konn:
+        konn.row_factory = sqlite3.Row
+        red = konn.execute("SELECT sifra_hash FROM ucionice WHERE kod = ?", (kod,)).fetchone()
+        sacuvani = (red["sifra_hash"] if red else "") or ""
+        if not sacuvani:
+            return False
+        return _upisi_hash(kod, sifra) == sacuvani
+
+
+def _db_postavi_skolu(kod, grad=None, skola=None, sifra_hash=None):
+    """Djelimičan upsert — samo polja koja nisu None se mijenjaju."""
+    vrijeme = datetime.now().isoformat(timespec="seconds")
+    with _db_lock, _db_konekcija() as konn:
+        konn.row_factory = sqlite3.Row
+        red = konn.execute(
+            "SELECT grad, skola, sifra_hash FROM ucionice WHERE kod = ?", (kod,)
+        ).fetchone()
+        novi_grad  = grad  if grad  is not None else (red["grad"]       if red else "")
+        novi_skola = skola if skola is not None else (red["skola"]      if red else "")
+        novi_sifra = sifra_hash if sifra_hash is not None else (red["sifra_hash"] if red else "")
+        konn.execute("""
+            INSERT INTO ucionice (kod, grad, skola, sifra_hash, azurirano)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(kod) DO UPDATE SET grad=excluded.grad, skola=excluded.skola,
+                                            sifra_hash=excluded.sifra_hash,
+                                            azurirano=excluded.azurirano
+        """, (kod, novi_grad or "", novi_skola or "", novi_sifra or "", vrijeme))
+
+
+def _db_obrisi_rad(rad_id, kod):
+    with _db_lock, _db_konekcija() as konn:
+        cur = konn.execute("DELETE FROM radovi WHERE id = ? AND kod = ?", (rad_id, kod))
+        return cur.rowcount
+
+
+def _db_obrisi_ucenika(kod, ucenik_ime):
+    with _db_lock, _db_konekcija() as konn:
+        cur = konn.execute(
+            "DELETE FROM radovi WHERE kod = ? AND ucenik_ime = ?", (kod, ucenik_ime))
+        return cur.rowcount
 
 
 def _db_sacuvaj_rad(kod, ucenik_ime, razred, promet_dug, promet_pot,
@@ -170,20 +236,38 @@ def _db_statistika(kod):
         ukupno = konn.execute(
             "SELECT COUNT(*) AS n FROM radovi WHERE kod = ?", (kod,)
         ).fetchone()["n"]
-        po_ucenika = konn.execute("""
-            SELECT ucenik_ime,
+        skola_red = konn.execute(
+            "SELECT grad, skola, sifra_hash FROM ucionice WHERE kod = ?", (kod,)
+        ).fetchone()
+        grad  = skola_red["grad"]  if skola_red else ""
+        skola = skola_red["skola"] if skola_red else ""
+        sifra_postavljena = bool(skola_red["sifra_hash"]) if skola_red else False
+        redovi = konn.execute("""
+            SELECT COALESCE(NULLIF(TRIM(razred), ''), '(bez razreda)') AS razred,
+                   ucenik_ime,
                    COUNT(*)              AS broj_radova,
                    AVG(broj_gresaka)     AS prosjek_gresaka,
                    MAX(vrijeme)          AS poslednji_put,
                    SUM(zavrsio)          AS broj_zavrsenih
             FROM radovi WHERE kod = ?
-            GROUP BY ucenik_ime
-            ORDER BY poslednji_put DESC
+            GROUP BY razred, ucenik_ime
+            ORDER BY razred ASC, poslednji_put DESC
         """, (kod,)).fetchall()
+        po_razredu_map = {}
+        redoslijed = []
+        for r in redovi:
+            rz = r["razred"]
+            if rz not in po_razredu_map:
+                po_razredu_map[rz] = []
+                redoslijed.append(rz)
+            po_razredu_map[rz].append(dict(r))
         return {
             "kod": kod,
+            "grad": grad,
+            "skola": skola,
+            "sifra_postavljena": sifra_postavljena,
             "ukupno_radova": ukupno,
-            "po_ucenika": [dict(r) for r in po_ucenika],
+            "po_razredu": [{"razred": rz, "ucenici": po_razredu_map[rz]} for rz in redoslijed],
         }
 
 
@@ -395,6 +479,68 @@ class RelayHandler(BaseHTTPRequestHandler):
                     podaci_dict=data.get("podaci", {}),
                 )
                 self._json({"status": "ok", "id": novi_id})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
+        # Profesor postavlja/ažurira grad i školu za svoj kod učionice —
+        # koristi se za organizaciju Istorije/statistike (Grad → Škola → Razred).
+        elif path == "/postavi_skolu":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            if not kod:
+                self._json({"greska": "Nedostaje kod"}, 400)
+                return
+            try:
+                _db_postavi_skolu(kod, grad=str(data.get("grad", "")).strip(),
+                                   skola=str(data.get("skola", "")).strip())
+                self._json({"status": "ok"})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
+        # Profesor postavlja/mijenja šifru za brisanje podataka iz istorije —
+        # bez ove šifre niko (pa ni neko ko sazna kod učionice) ne može brisati.
+        elif path == "/postavi_sifru":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            sifra = str(data.get("sifra", ""))
+            if not kod or not sifra:
+                self._json({"greska": "Nedostaje kod ili šifra"}, 400)
+                return
+            try:
+                _db_postavi_skolu(kod, sifra_hash=_upisi_hash(kod, sifra))
+                self._json({"status": "ok"})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
+        # Brisanje jednog sačuvanog rada — zahtijeva ispravnu šifru učionice.
+        elif path == "/obrisi_rad":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            sifra = str(data.get("sifra", ""))
+            rad_id = data.get("rad_id")
+            if not kod or not rad_id:
+                self._json({"greska": "Nedostaje kod ili rad_id"}, 400)
+                return
+            if not _provjeri_sifru(kod, sifra):
+                self._json({"greska": "Pogrešna šifra ili šifra još nije postavljena."}, 403)
+                return
+            try:
+                obrisano = _db_obrisi_rad(int(rad_id), kod)
+                self._json({"status": "ok", "obrisano": obrisano})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
+        # Brisanje svih sačuvanih radova jednog učenika — zahtijeva šifru.
+        elif path == "/obrisi_ucenika":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            sifra = str(data.get("sifra", ""))
+            ucenik_ime = str(data.get("ucenik_ime", "")).strip()
+            if not kod or not ucenik_ime:
+                self._json({"greska": "Nedostaje kod ili ucenik_ime"}, 400)
+                return
+            if not _provjeri_sifru(kod, sifra):
+                self._json({"greska": "Pogrešna šifra ili šifra još nije postavljena."}, 403)
+                return
+            try:
+                obrisano = _db_obrisi_ucenika(kod, ucenik_ime)
+                self._json({"status": "ok", "obrisano": obrisano})
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
 
