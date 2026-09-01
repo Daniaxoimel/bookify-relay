@@ -114,71 +114,191 @@ def _db_init():
             CREATE INDEX IF NOT EXISTS idx_radovi_kod_ucenik
             ON radovi (kod, ucenik_ime)
         """)
-        # Grad/škola/šifra po kodu učionice — za organizaciju istorije/statistike
-        # (Grad → Škola → Razred → Učenici) i za zaštitu brisanja podataka.
+        # Grad/škola/šifra po kodu učionice — za "solo" nastavnike (bez dijeljene
+        # škole) i kao poveznica ka instituciji (skolski_kod) za dijeljeni pogled.
         konn.execute("""
             CREATE TABLE IF NOT EXISTS ucionice (
-                kod         TEXT PRIMARY KEY,
-                grad        TEXT DEFAULT '',
-                skola       TEXT DEFAULT '',
-                sifra_hash  TEXT DEFAULT '',
-                azurirano   TEXT
+                kod          TEXT PRIMARY KEY,
+                grad         TEXT DEFAULT '',
+                skola        TEXT DEFAULT '',
+                sifra_hash   TEXT DEFAULT '',
+                skolski_kod  TEXT DEFAULT '',
+                azurirano    TEXT
             )
         """)
-        # Migracija — ako je tabela ucionice napravljena prije uvođenja šifre.
-        try:
-            konn.execute("ALTER TABLE ucionice ADD COLUMN sifra_hash TEXT DEFAULT ''")
-        except Exception:
-            pass  # kolona već postoji
+        # Institucija (škola) koju dijeli više nastavnika — svi njihovi kodovi
+        # učionica koji se pridruže istom skolski_kod-u vide zajedničku istoriju
+        # (Grad → Škola → Razred → Učenici) i dijele istu šifru za brisanje.
+        konn.execute("""
+            CREATE TABLE IF NOT EXISTS institucije (
+                skolski_kod  TEXT PRIMARY KEY,
+                grad         TEXT NOT NULL,
+                skola        TEXT NOT NULL,
+                sifra_hash   TEXT NOT NULL,
+                kreirano     TEXT
+            )
+        """)
+        # Migracije za baze napravljene prije uvođenja šifre/institucija.
+        for _alter in (
+            "ALTER TABLE ucionice ADD COLUMN sifra_hash TEXT DEFAULT ''",
+            "ALTER TABLE ucionice ADD COLUMN skolski_kod TEXT DEFAULT ''",
+        ):
+            try:
+                konn.execute(_alter)
+            except Exception:
+                pass  # kolona već postoji
 
 
-def _upisi_hash(kod, sifra):
-    return hashlib.sha256(f"{kod}:{sifra or ''}".encode("utf-8")).hexdigest()
+def _upisi_hash(sol, sifra):
+    return hashlib.sha256(f"{sol}:{sifra or ''}".encode("utf-8")).hexdigest()
+
+
+def _generisi_skolski_kod(konn):
+    import random
+    alfabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    while True:
+        kandidat = "".join(random.choices(alfabet, k=6))
+        if not konn.execute(
+                "SELECT 1 FROM institucije WHERE skolski_kod = ?", (kandidat,)).fetchone():
+            return kandidat
+
+
+def _kodovi_institucije(konn, skolski_kod):
+    return [r[0] for r in konn.execute(
+        "SELECT kod FROM ucionice WHERE skolski_kod = ?", (skolski_kod,)).fetchall()]
+
+
+def _povezanost_koda(konn, kod):
+    """Vraća red iz ucionice za dati kod (ili None)."""
+    konn.row_factory = sqlite3.Row
+    return konn.execute(
+        "SELECT grad, skola, sifra_hash, skolski_kod FROM ucionice WHERE kod = ?", (kod,)
+    ).fetchone()
+
+
+def _kodovi_za_upit(konn, kod):
+    """Skup kodova preko kojih treba tražiti radove za dati kod — ako je kod
+    dio dijeljene institucije, to su SVI kodovi te institucije; inače samo taj
+    jedan (solo način rada, kao i prije)."""
+    red = _povezanost_koda(konn, kod)
+    skolski_kod = (red["skolski_kod"] if red else "") or ""
+    if skolski_kod:
+        kodovi = _kodovi_institucije(konn, skolski_kod)
+        return kodovi or [kod], skolski_kod
+    return [kod], ""
 
 
 def _provjeri_sifru(kod, sifra):
-    """Vraća True samo ako je šifra tačna. Ako šifra još nije postavljena za
-    ovaj kod, brisanje se odbija (mora se prvo postaviti šifra u profesorskom
-    panelu — Grad/Škola)."""
+    """Vraća True samo ako je šifra tačna — protiv institucije (dijeljena škola)
+    ako je kod pridružen jednoj, inače protiv šifre samog koda (solo način).
+    Ako šifra još nije postavljena nigdje, brisanje se odbija."""
     with _db_lock, _db_konekcija() as konn:
-        konn.row_factory = sqlite3.Row
-        red = konn.execute("SELECT sifra_hash FROM ucionice WHERE kod = ?", (kod,)).fetchone()
-        sacuvani = (red["sifra_hash"] if red else "") or ""
+        red = _povezanost_koda(konn, kod)
+        if not red:
+            return False
+        skolski_kod = (red["skolski_kod"] or "")
+        if skolski_kod:
+            konn.row_factory = sqlite3.Row
+            inst = konn.execute(
+                "SELECT sifra_hash FROM institucije WHERE skolski_kod = ?", (skolski_kod,)
+            ).fetchone()
+            sacuvani = (inst["sifra_hash"] if inst else "") or ""
+            if not sacuvani:
+                return False
+            return _upisi_hash(skolski_kod, sifra) == sacuvani
+        sacuvani = red["sifra_hash"] or ""
         if not sacuvani:
             return False
         return _upisi_hash(kod, sifra) == sacuvani
 
 
 def _db_postavi_skolu(kod, grad=None, skola=None, sifra_hash=None):
-    """Djelimičan upsert — samo polja koja nisu None se mijenjaju."""
+    """Djelimičan upsert nad ucionice (solo način) — samo polja koja nisu None
+    se mijenjaju. Ne dira institucije (dijeljenu školu), samo lokalnu etiketu
+    za kodove koji NISU pridruženi nijednoj instituciji."""
     vrijeme = datetime.now().isoformat(timespec="seconds")
     with _db_lock, _db_konekcija() as konn:
         konn.row_factory = sqlite3.Row
         red = konn.execute(
-            "SELECT grad, skola, sifra_hash FROM ucionice WHERE kod = ?", (kod,)
+            "SELECT grad, skola, sifra_hash, skolski_kod FROM ucionice WHERE kod = ?", (kod,)
         ).fetchone()
         novi_grad  = grad  if grad  is not None else (red["grad"]       if red else "")
         novi_skola = skola if skola is not None else (red["skola"]      if red else "")
         novi_sifra = sifra_hash if sifra_hash is not None else (red["sifra_hash"] if red else "")
+        skolski_kod = (red["skolski_kod"] if red else "") or ""
         konn.execute("""
-            INSERT INTO ucionice (kod, grad, skola, sifra_hash, azurirano)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO ucionice (kod, grad, skola, sifra_hash, skolski_kod, azurirano)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(kod) DO UPDATE SET grad=excluded.grad, skola=excluded.skola,
                                             sifra_hash=excluded.sifra_hash,
                                             azurirano=excluded.azurirano
-        """, (kod, novi_grad or "", novi_skola or "", novi_sifra or "", vrijeme))
+        """, (kod, novi_grad or "", novi_skola or "", novi_sifra or "", skolski_kod, vrijeme))
+
+
+def _db_napravi_instituciju(kod, grad, skola, sifra):
+    """Pravi novu dijeljenu školu (instituciju) i odmah joj pridružuje trenutni
+    kod učionice. Vraća novogenerisani skolski_kod (daje se kolegama da se
+    pridruže)."""
+    vrijeme = datetime.now().isoformat(timespec="seconds")
+    with _db_lock, _db_konekcija() as konn:
+        skolski_kod = _generisi_skolski_kod(konn)
+        konn.execute("""
+            INSERT INTO institucije (skolski_kod, grad, skola, sifra_hash, kreirano)
+            VALUES (?, ?, ?, ?, ?)
+        """, (skolski_kod, grad, skola, _upisi_hash(skolski_kod, sifra), vrijeme))
+        konn.execute("""
+            INSERT INTO ucionice (kod, grad, skola, sifra_hash, skolski_kod, azurirano)
+            VALUES (?, ?, ?, '', ?, ?)
+            ON CONFLICT(kod) DO UPDATE SET grad=excluded.grad, skola=excluded.skola,
+                                            skolski_kod=excluded.skolski_kod,
+                                            azurirano=excluded.azurirano
+        """, (kod, grad, skola, skolski_kod, vrijeme))
+    return skolski_kod
+
+
+def _db_pridruzi_skoli(kod, skolski_kod, sifra):
+    """Pridružuje kod učionice postojećoj instituciji ako je šifra ispravna.
+    Vraća (True, grad, skola) ili (False, None, None) ako kod/šifra ne valjaju."""
+    with _db_lock, _db_konekcija() as konn:
+        konn.row_factory = sqlite3.Row
+        inst = konn.execute(
+            "SELECT grad, skola, sifra_hash FROM institucije WHERE skolski_kod = ?",
+            (skolski_kod,)).fetchone()
+        if not inst or _upisi_hash(skolski_kod, sifra) != inst["sifra_hash"]:
+            return False, None, None
+        vrijeme = datetime.now().isoformat(timespec="seconds")
+        konn.execute("""
+            INSERT INTO ucionice (kod, grad, skola, sifra_hash, skolski_kod, azurirano)
+            VALUES (?, ?, ?, '', ?, ?)
+            ON CONFLICT(kod) DO UPDATE SET grad=excluded.grad, skola=excluded.skola,
+                                            skolski_kod=excluded.skolski_kod,
+                                            azurirano=excluded.azurirano
+        """, (kod, inst["grad"], inst["skola"], skolski_kod, vrijeme))
+        return True, inst["grad"], inst["skola"]
+
+
+def _db_napusti_skolu(kod):
+    """Vraća kod učionice u solo način (bez dijeljene institucije)."""
+    with _db_lock, _db_konekcija() as konn:
+        konn.execute("UPDATE ucionice SET skolski_kod = '' WHERE kod = ?", (kod,))
 
 
 def _db_obrisi_rad(rad_id, kod):
     with _db_lock, _db_konekcija() as konn:
-        cur = konn.execute("DELETE FROM radovi WHERE id = ? AND kod = ?", (rad_id, kod))
+        kodovi, _ = _kodovi_za_upit(konn, kod)
+        upitnici = ",".join("?" * len(kodovi))
+        cur = konn.execute(
+            f"DELETE FROM radovi WHERE id = ? AND kod IN ({upitnici})", [rad_id] + kodovi)
         return cur.rowcount
 
 
 def _db_obrisi_ucenika(kod, ucenik_ime):
     with _db_lock, _db_konekcija() as konn:
+        kodovi, _ = _kodovi_za_upit(konn, kod)
+        upitnici = ",".join("?" * len(kodovi))
         cur = konn.execute(
-            "DELETE FROM radovi WHERE kod = ? AND ucenik_ime = ?", (kod, ucenik_ime))
+            f"DELETE FROM radovi WHERE kod IN ({upitnici}) AND ucenik_ime = ?",
+            kodovi + [ucenik_ime])
         return cur.rowcount
 
 
@@ -199,20 +319,22 @@ def _db_sacuvaj_rad(kod, ucenik_ime, razred, promet_dug, promet_pot,
 def _db_istorija(kod, ucenik_ime=None):
     with _db_lock, _db_konekcija() as konn:
         konn.row_factory = sqlite3.Row
+        kodovi, _ = _kodovi_za_upit(konn, kod)
+        upitnici = ",".join("?" * len(kodovi))
         if ucenik_ime:
-            redovi = konn.execute("""
+            redovi = konn.execute(f"""
                 SELECT id, kod, ucenik_ime, razred, vrijeme, promet_dug,
                        promet_pot, broj_gresaka, zavrsio
-                FROM radovi WHERE kod = ? AND ucenik_ime = ?
+                FROM radovi WHERE kod IN ({upitnici}) AND ucenik_ime = ?
                 ORDER BY vrijeme DESC
-            """, (kod, ucenik_ime)).fetchall()
+            """, kodovi + [ucenik_ime]).fetchall()
         else:
-            redovi = konn.execute("""
+            redovi = konn.execute(f"""
                 SELECT id, kod, ucenik_ime, razred, vrijeme, promet_dug,
                        promet_pot, broj_gresaka, zavrsio
-                FROM radovi WHERE kod = ?
+                FROM radovi WHERE kod IN ({upitnici})
                 ORDER BY vrijeme DESC
-            """, (kod,)).fetchall()
+            """, kodovi).fetchall()
         return [dict(r) for r in redovi]
 
 
@@ -233,26 +355,40 @@ def _db_detalji(rad_id):
 def _db_statistika(kod):
     with _db_lock, _db_konekcija() as konn:
         konn.row_factory = sqlite3.Row
+        red = _povezanost_koda(konn, kod)
+        skolski_kod = (red["skolski_kod"] if red else "") or ""
+
+        if skolski_kod:
+            inst = konn.execute(
+                "SELECT grad, skola, sifra_hash FROM institucije WHERE skolski_kod = ?",
+                (skolski_kod,)).fetchone()
+            grad  = inst["grad"]  if inst else (red["grad"] if red else "")
+            skola = inst["skola"] if inst else (red["skola"] if red else "")
+            sifra_postavljena = bool(inst["sifra_hash"]) if inst else False
+            kodovi = _kodovi_institucije(konn, skolski_kod) or [kod]
+            broj_nastavnika = len(kodovi)
+        else:
+            grad  = red["grad"]  if red else ""
+            skola = red["skola"] if red else ""
+            sifra_postavljena = bool(red["sifra_hash"]) if red else False
+            kodovi = [kod]
+            broj_nastavnika = 1
+
+        upitnici = ",".join("?" * len(kodovi))
         ukupno = konn.execute(
-            "SELECT COUNT(*) AS n FROM radovi WHERE kod = ?", (kod,)
+            f"SELECT COUNT(*) AS n FROM radovi WHERE kod IN ({upitnici})", kodovi
         ).fetchone()["n"]
-        skola_red = konn.execute(
-            "SELECT grad, skola, sifra_hash FROM ucionice WHERE kod = ?", (kod,)
-        ).fetchone()
-        grad  = skola_red["grad"]  if skola_red else ""
-        skola = skola_red["skola"] if skola_red else ""
-        sifra_postavljena = bool(skola_red["sifra_hash"]) if skola_red else False
-        redovi = konn.execute("""
+        redovi = konn.execute(f"""
             SELECT COALESCE(NULLIF(TRIM(razred), ''), '(bez razreda)') AS razred,
                    ucenik_ime,
                    COUNT(*)              AS broj_radova,
                    AVG(broj_gresaka)     AS prosjek_gresaka,
                    MAX(vrijeme)          AS poslednji_put,
                    SUM(zavrsio)          AS broj_zavrsenih
-            FROM radovi WHERE kod = ?
+            FROM radovi WHERE kod IN ({upitnici})
             GROUP BY razred, ucenik_ime
             ORDER BY razred ASC, poslednji_put DESC
-        """, (kod,)).fetchall()
+        """, kodovi).fetchall()
         po_razredu_map = {}
         redoslijed = []
         for r in redovi:
@@ -265,6 +401,9 @@ def _db_statistika(kod):
             "kod": kod,
             "grad": grad,
             "skola": skola,
+            "skolski_kod": skolski_kod,
+            "nacin": "skola" if skolski_kod else "solo",
+            "broj_nastavnika": broj_nastavnika,
             "sifra_postavljena": sifra_postavljena,
             "ukupno_radova": ukupno,
             "po_razredu": [{"razred": rz, "ucenici": po_razredu_map[rz]} for rz in redoslijed],
@@ -482,8 +621,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
 
-        # Profesor postavlja/ažurira grad i školu za svoj kod učionice —
-        # koristi se za organizaciju Istorije/statistike (Grad → Škola → Razred).
+        # Profesor postavlja/ažurira grad i školu SAMO kao lokalnu etiketu (solo
+        # način, bez dijeljenja s kolegama) — za dijeljenu školu koristi se
+        # /napravi_skolu ili /pridruzi_skoli.
         elif path == "/postavi_skolu":
             kod = str(data.get("classroom_kod", "")).strip().upper()
             if not kod:
@@ -498,6 +638,7 @@ class RelayHandler(BaseHTTPRequestHandler):
 
         # Profesor postavlja/mijenja šifru za brisanje podataka iz istorije —
         # bez ove šifre niko (pa ni neko ko sazna kod učionice) ne može brisati.
+        # (Solo način — kod koji NIJE pridružen dijeljenoj školi.)
         elif path == "/postavi_sifru":
             kod = str(data.get("classroom_kod", "")).strip().upper()
             sifra = str(data.get("sifra", ""))
@@ -506,6 +647,52 @@ class RelayHandler(BaseHTTPRequestHandler):
                 return
             try:
                 _db_postavi_skolu(kod, sifra_hash=_upisi_hash(kod, sifra))
+                self._json({"status": "ok"})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
+        # Nastavnik pravi NOVU dijeljenu školu (instituciju) — generiše se
+        # skolski_kod koji se daje kolegama da se pridruže istoj istoriji.
+        elif path == "/napravi_skolu":
+            kod   = str(data.get("classroom_kod", "")).strip().upper()
+            grad  = str(data.get("grad", "")).strip()
+            skola = str(data.get("skola", "")).strip()
+            sifra = str(data.get("sifra", ""))
+            if not kod or not grad or not skola or not sifra:
+                self._json({"greska": "Nedostaje kod, grad, škola ili šifra"}, 400)
+                return
+            try:
+                skolski_kod = _db_napravi_instituciju(kod, grad, skola, sifra)
+                self._json({"status": "ok", "skolski_kod": skolski_kod})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
+        # Nastavnik se pridružuje POSTOJEĆOJ dijeljenoj školi — treba školski_kod
+        # i šifru koje mu je dao kolega koji je školu napravio.
+        elif path == "/pridruzi_skoli":
+            kod         = str(data.get("classroom_kod", "")).strip().upper()
+            skolski_kod = str(data.get("skolski_kod", "")).strip().upper()
+            sifra       = str(data.get("sifra", ""))
+            if not kod or not skolski_kod:
+                self._json({"greska": "Nedostaje kod ili školski kod"}, 400)
+                return
+            try:
+                uspjeh, grad, skola = _db_pridruzi_skoli(kod, skolski_kod, sifra)
+                if not uspjeh:
+                    self._json({"greska": "Školski kod ili šifra nisu ispravni."}, 403)
+                    return
+                self._json({"status": "ok", "grad": grad, "skola": skola})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
+        # Nastavnik napušta dijeljenu školu — vraća se u solo način rada.
+        elif path == "/napusti_skolu":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            if not kod:
+                self._json({"greska": "Nedostaje kod"}, 400)
+                return
+            try:
+                _db_napusti_skolu(kod)
                 self._json({"status": "ok"})
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
