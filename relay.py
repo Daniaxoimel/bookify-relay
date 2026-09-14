@@ -151,6 +151,25 @@ def _db_init():
                 PRIMARY KEY (kod, ucenik_id)
             )
         """)
+        # Klasifikovane greške učenika tokom rada (formativno praćenje) —
+        # bez vremena, samo datum, redni broj promjene, oblast i tip. Tip
+        # greške je vidljiv SAMO profesoru, nikad učeniku.
+        konn.execute("""
+            CREATE TABLE IF NOT EXISTS greske_log (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                kod                  TEXT NOT NULL,
+                ucenik_id            TEXT NOT NULL,
+                datum                TEXT,
+                redni_broj_promjene  TEXT,
+                oblast               TEXT,
+                tip                  TEXT,
+                vrijeme              REAL
+            )
+        """)
+        konn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_greske_kod_ucenik
+            ON greske_log (kod, ucenik_id)
+        """)
         # Migracije za baze napravljene prije uvođenja šifre/institucija.
         for _alter in (
             "ALTER TABLE ucionice ADD COLUMN sifra_hash TEXT DEFAULT ''",
@@ -365,6 +384,39 @@ def _db_svi_rucni_zavrsio(kod):
         return {r[0]: bool(r[1]) for r in redovi}
 
 
+def _db_prijavi_gresku(kod, ucenik_id, datum, redni_broj_promjene, oblast, tip):
+    """Ucenikova aplikacija prijavljuje klasifikovanu grešku — bez vremena
+    tačnog trenutka, samo datum rada koji šalje učenik."""
+    with _db_lock, _db_konekcija() as konn:
+        konn.execute("""
+            INSERT INTO greske_log (kod, ucenik_id, datum, redni_broj_promjene,
+                                     oblast, tip, vrijeme)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (kod, ucenik_id, datum or "", str(redni_broj_promjene or ""),
+              oblast or "", tip or "ostalo", time.time()))
+
+
+def _db_greske(kod, ucenik_id=None):
+    """Klasifikovane greške za profesora — po jednom učeniku ili cijelom
+    kodu učionice, najnovije prve."""
+    with _db_lock, _db_konekcija() as konn:
+        if ucenik_id:
+            redovi = konn.execute("""
+                SELECT datum, redni_broj_promjene, oblast, tip
+                FROM greske_log WHERE kod = ? AND ucenik_id = ?
+                ORDER BY id DESC
+            """, (kod, ucenik_id)).fetchall()
+            return [{"datum": r[0], "redni_broj_promjene": r[1],
+                     "oblast": r[2], "tip": r[3]} for r in redovi]
+        redovi = konn.execute("""
+            SELECT ucenik_id, datum, redni_broj_promjene, oblast, tip
+            FROM greske_log WHERE kod = ?
+            ORDER BY id DESC
+        """, (kod,)).fetchall()
+        return [{"ucenik_id": r[0], "datum": r[1], "redni_broj_promjene": r[2],
+                 "oblast": r[3], "tip": r[4]} for r in redovi]
+
+
 def _db_istorija(kod, ucenik_ime=None):
     with _db_lock, _db_konekcija() as konn:
         konn.row_factory = sqlite3.Row
@@ -518,7 +570,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                 return
             with lock:
                 z = zadaci.get(_kljuc_zadatka(kod), {"tekst": "", "tip": "tekst"})
-            self._json({"tekst": z.get("tekst", ""), "tip": z.get("tip", "tekst")})
+            self._json({"tekst": z.get("tekst", ""), "tip": z.get("tip", "tekst"),
+                        "oblast": z.get("oblast", ""), "broj_promjena": z.get("broj_promjena")})
 
         elif path == "/ping":
             self._json({"status": "ok", "relay": "Bookify Relay v3.0"})
@@ -567,6 +620,18 @@ class RelayHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
 
+        # Klasifikovane greške po učeniku (formativno praćenje, samo za
+        # profesora — tip greške se NIKAD ne šalje/prikazuje učeniku).
+        elif path == "/greske":
+            if not kod:
+                self._json({"greska": "Nedostaje kod"}, 400)
+                return
+            ucenik_id = (params.get("ucenik_id", [""])[0] or "").strip()
+            try:
+                self._json({"greske": _db_greske(kod, ucenik_id or None)})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
         else:
             self._json({"greska": "Not found"}, 404)
 
@@ -596,6 +661,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "promet_pot":    data.get("promet_pot", 0),
                     "zavrsio":       data.get("zavrsio", False),
                     "broj_gresaka":  data.get("broj_gresaka", 0),
+                    "planirani_broj_promjena": data.get("planirani_broj_promjena"),
+                    "preskocene_promjene": data.get("preskocene_promjene", []),
                     "zadnji_update": data.get("zadnji_update", ""),
                     "state":         data.get("state", {}),
                     "ip":            ucenik_id,
@@ -605,7 +672,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                 z = zadaci.get(_kljuc_zadatka(kod, ucenik_id)) or \
                     zadaci.get(_kljuc_zadatka(kod)) or \
                     {"tekst": "", "tip": "tekst"}
-                zadatak = {"tekst": z.get("tekst", ""), "tip": z.get("tip", "tekst")}
+                zadatak = {"tekst": z.get("tekst", ""), "tip": z.get("tip", "tekst"),
+                           "oblast": z.get("oblast", ""), "broj_promjena": z.get("broj_promjena")}
                 o = oznake.get(f"{kod}|{ucenik_id}")
                 lista_oznaka = o.get("lista", []) if o else []
             self._json({"status": "ok", "zadatak": zadatak, "oznake": lista_oznaka})
@@ -615,6 +683,8 @@ class RelayHandler(BaseHTTPRequestHandler):
             kod = str(data.get("classroom_kod", "")).strip().upper()
             tekst = data.get("tekst", "")
             tip = data.get("tip", "tekst")
+            oblast = data.get("oblast", "")
+            broj_promjena = data.get("broj_promjena")
             ucenik_id = str(data.get("ucenik_id", "")).strip()
             if not kod:
                 self._json({"greska": "Nedostaje kod"}, 400)
@@ -622,10 +692,31 @@ class RelayHandler(BaseHTTPRequestHandler):
             with lock:
                 kljuc = _kljuc_zadatka(kod, ucenik_id if ucenik_id else None)
                 if tekst:
-                    zadaci[kljuc] = {"tekst": tekst, "tip": tip, "vrijeme": time.time()}
+                    zadaci[kljuc] = {"tekst": tekst, "tip": tip, "oblast": oblast,
+                                      "broj_promjena": broj_promjena, "vrijeme": time.time()}
                 else:
                     zadaci.pop(kljuc, None)  # Obriši — globalni (ako postoji) dobija prednost
             self._json({"status": "ok"})
+
+        # Ucenik prijavljuje klasifikovanu grešku (formativno praćenje):
+        # POST /prijavi_gresku — bez vremena, samo datum + redni broj
+        # promjene + oblast + tip. Tip se NIKAD ne vraća/prikazuje učeniku.
+        elif path == "/prijavi_gresku":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            ucenik_id = str(data.get("ucenik_id", "")).strip()
+            if not kod or not ucenik_id:
+                self._json({"greska": "Nedostaje kod ili ucenik_id"}, 400)
+                return
+            try:
+                _db_prijavi_gresku(
+                    kod=kod, ucenik_id=ucenik_id,
+                    datum=data.get("datum", ""),
+                    redni_broj_promjene=data.get("redni_broj_promjene", ""),
+                    oblast=data.get("oblast", ""),
+                    tip=data.get("tip", "ostalo"))
+                self._json({"status": "ok"})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
 
         # Profesor salje oznake: POST /posalji_oznake
         elif path == "/posalji_oznake":
