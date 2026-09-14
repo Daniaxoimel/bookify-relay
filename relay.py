@@ -138,6 +138,19 @@ def _db_init():
                 kreirano     TEXT
             )
         """)
+        # Ručna odluka profesora o statusu "završio" po učeniku (nadjačava
+        # ono što učenikova aplikacija sama izračuna). Trajno se pamti po
+        # (kod, ucenik_id) i primjenjuje se i na živi prikaz i na trajno
+        # sačuvane radove tog učenika.
+        konn.execute("""
+            CREATE TABLE IF NOT EXISTS rucni_zavrsio (
+                kod        TEXT NOT NULL,
+                ucenik_id  TEXT NOT NULL,
+                zavrsio    INTEGER NOT NULL,
+                vrijeme    REAL,
+                PRIMARY KEY (kod, ucenik_id)
+            )
+        """)
         # Migracije za baze napravljene prije uvođenja šifre/institucija.
         for _alter in (
             "ALTER TABLE ucionice ADD COLUMN sifra_hash TEXT DEFAULT ''",
@@ -303,10 +316,18 @@ def _db_obrisi_ucenika(kod, ucenik_ime):
 
 
 def _db_sacuvaj_rad(kod, ucenik_ime, razred, promet_dug, promet_pot,
-                     broj_gresaka, zavrsio, podaci_dict):
+                     broj_gresaka, zavrsio, podaci_dict, ucenik_id=None):
     vrijeme = datetime.now().isoformat(timespec="seconds")
     podaci_json = json.dumps(podaci_dict, ensure_ascii=False)
     with _db_lock, _db_konekcija() as konn:
+        # Ako profesor ima ručno postavljen status za ovog učenika, on ima
+        # prednost nad onim što učenikova aplikacija sama izračuna.
+        if ucenik_id:
+            red = konn.execute(
+                "SELECT zavrsio FROM rucni_zavrsio WHERE kod = ? AND ucenik_id = ?",
+                (kod, ucenik_id)).fetchone()
+            if red is not None:
+                zavrsio = bool(red[0])
         cur = konn.execute("""
             INSERT INTO radovi (kod, ucenik_ime, razred, vrijeme, promet_dug,
                                  promet_pot, broj_gresaka, zavrsio, podaci)
@@ -314,6 +335,34 @@ def _db_sacuvaj_rad(kod, ucenik_ime, razred, promet_dug, promet_pot,
         """, (kod, ucenik_ime, razred, vrijeme, promet_dug or 0, promet_pot or 0,
               broj_gresaka or 0, 1 if zavrsio else 0, podaci_json))
         return cur.lastrowid
+
+
+def _db_postavi_rucni_zavrsio(kod, ucenik_id, zavrsio):
+    """Profesor ručno postavlja da li je učenik završio rad ili ne."""
+    with _db_lock, _db_konekcija() as konn:
+        konn.execute("""
+            INSERT INTO rucni_zavrsio (kod, ucenik_id, zavrsio, vrijeme)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(kod, ucenik_id) DO UPDATE SET
+                zavrsio = excluded.zavrsio, vrijeme = excluded.vrijeme
+        """, (kod, ucenik_id, 1 if zavrsio else 0, time.time()))
+
+
+def _db_obrisi_rucni_zavrsio(kod, ucenik_id):
+    """Vrati status na automatski (ukloni profesorovo ručno postavljanje)."""
+    with _db_lock, _db_konekcija() as konn:
+        konn.execute(
+            "DELETE FROM rucni_zavrsio WHERE kod = ? AND ucenik_id = ?",
+            (kod, ucenik_id))
+
+
+def _db_svi_rucni_zavrsio(kod):
+    """Svi ručno postavljeni statusi za jedan kod učionice: {ucenik_id: bool}."""
+    with _db_lock, _db_konekcija() as konn:
+        redovi = konn.execute(
+            "SELECT ucenik_id, zavrsio FROM rucni_zavrsio WHERE kod = ?",
+            (kod,)).fetchall()
+        return {r[0]: bool(r[1]) for r in redovi}
 
 
 def _db_istorija(kod, ucenik_ime=None):
@@ -451,6 +500,16 @@ class RelayHandler(BaseHTTPRequestHandler):
                         u2 = dict(u)
                         u2["signali"] = signali.get(kod, {}).get(uid, [])
                         aktivni[uid] = u2
+            # Ručna odluka profesora o "završio" ima prednost nad onim što
+            # učenikova aplikacija sama izračuna.
+            try:
+                rucni = _db_svi_rucni_zavrsio(kod)
+            except Exception:
+                rucni = {}
+            for uid, vrijednost in rucni.items():
+                if uid in aktivni:
+                    aktivni[uid]["zavrsio"] = vrijednost
+                    aktivni[uid]["zavrsio_rucno"] = True
             self._json({"ucenici": aktivni})
 
         elif path == "/zadatak":
@@ -580,6 +639,28 @@ class RelayHandler(BaseHTTPRequestHandler):
                 oznake[f"{kod}|{ucenik_id}"] = {"lista": lista, "vrijeme": time.time()}
             self._json({"status": "ok"})
 
+        # Profesor ručno postavlja da li je učenik završio rad: POST /postavi_zavrsio
+        # {classroom_kod, ucenik_id, zavrsio} — ako je "zavrsio" None/izostavljen,
+        # ukida se ručno postavljanje i status se vraća na automatski.
+        elif path == "/postavi_zavrsio":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            ucenik_id = str(data.get("ucenik_id", "")).strip()
+            if not kod or not ucenik_id:
+                self._json({"greska": "Nedostaje kod ili ucenik_id"}, 400)
+                return
+            try:
+                if "zavrsio" in data and data.get("zavrsio") is not None:
+                    _db_postavi_rucni_zavrsio(kod, ucenik_id, bool(data.get("zavrsio")))
+                else:
+                    _db_obrisi_rucni_zavrsio(kod, ucenik_id)
+                with lock:
+                    u = sobe.get(kod, {}).get(ucenik_id)
+                    if u is not None and "zavrsio" in data and data.get("zavrsio") is not None:
+                        u["zavrsio"] = bool(data.get("zavrsio"))
+                self._json({"status": "ok"})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
         # Ucenik salje signal profesoru ("nisam siguran u ovaj red"): POST /posalji_signal
         elif path == "/posalji_signal":
             kod = str(data.get("classroom_kod", "")).strip().upper()
@@ -616,6 +697,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     broj_gresaka=data.get("broj_gresaka", 0),
                     zavrsio=data.get("zavrsio", False),
                     podaci_dict=data.get("podaci", {}),
+                    ucenik_id=str(data.get("ucenik_id", "")).strip() or None,
                 )
                 self._json({"status": "ok", "id": novi_id})
             except Exception as e:
