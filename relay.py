@@ -661,6 +661,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "promet_pot":    data.get("promet_pot", 0),
                     "zavrsio":       data.get("zavrsio", False),
                     "broj_gresaka":  data.get("broj_gresaka", 0),
+                    "oblast":        data.get("oblast", ""),
                     "planirani_broj_promjena": data.get("planirani_broj_promjena"),
                     "preskocene_promjene": data.get("preskocene_promjene", []),
                     "zadnji_update": data.get("zadnji_update", ""),
