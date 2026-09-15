@@ -384,6 +384,20 @@ def _db_svi_rucni_zavrsio(kod):
         return {r[0]: bool(r[1]) for r in redovi}
 
 
+def _db_azuriraj_zadnji_rad_zavrsio(kod, ucenik_ime, zavrsio):
+    """Kad profesor ručno postavi status, ažuriraj i POSLJEDNJI već sačuvani
+    rad tog učenika u istoriji (da se ne vidi zastarjeli 'ne' u istoriji dok
+    kartica pokazuje 'da')."""
+    with _db_lock, _db_konekcija() as konn:
+        red = konn.execute("""
+            SELECT id FROM radovi WHERE kod = ? AND ucenik_ime = ?
+            ORDER BY id DESC LIMIT 1
+        """, (kod, ucenik_ime)).fetchone()
+        if red:
+            konn.execute("UPDATE radovi SET zavrsio = ? WHERE id = ?",
+                        (1 if zavrsio else 0, red[0]))
+
+
 def _db_prijavi_gresku(kod, ucenik_id, datum, redni_broj_promjene, oblast, tip):
     """Ucenikova aplikacija prijavljuje klasifikovanu grešku — bez vremena
     tačnog trenutka, samo datum rada koji šalje učenik."""
@@ -737,12 +751,19 @@ class RelayHandler(BaseHTTPRequestHandler):
         elif path == "/postavi_zavrsio":
             kod = str(data.get("classroom_kod", "")).strip().upper()
             ucenik_id = str(data.get("ucenik_id", "")).strip()
+            ucenik_ime = str(data.get("ucenik_ime", "")).strip()
             if not kod or not ucenik_id:
                 self._json({"greska": "Nedostaje kod ili ucenik_id"}, 400)
                 return
             try:
                 if "zavrsio" in data and data.get("zavrsio") is not None:
-                    _db_postavi_rucni_zavrsio(kod, ucenik_id, bool(data.get("zavrsio")))
+                    zavrsio_novi = bool(data.get("zavrsio"))
+                    _db_postavi_rucni_zavrsio(kod, ucenik_id, zavrsio_novi)
+                    # Ažuriraj i posljednji već sačuvani rad ovog učenika u
+                    # istoriji, da se ručna odluka odmah vidi i tamo — ne
+                    # samo na živoj kartici.
+                    if ucenik_ime:
+                        _db_azuriraj_zadnji_rad_zavrsio(kod, ucenik_ime, zavrsio_novi)
                 else:
                     _db_obrisi_rucni_zavrsio(kod, ucenik_id)
                 with lock:
