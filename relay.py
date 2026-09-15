@@ -29,6 +29,11 @@ CISTI_SVAKIH = 600      # interval čišćenja (sekunde)
 SNAPSHOT_SVAKIH = 30    # interval čuvanja na disk (sekunde)
 SNAPSHOT_FILE = os.environ.get("RELAY_SNAPSHOT", "relay_state.json")
 
+# Šifra za objavljivanje update-a programa (bookify.py / profesori.py) —
+# SAMO ti (developer) treba da je znaš. Promijeni ovo prije puštanja u rad,
+# ili je postavi kao environment varijablu RELAY_ADMIN_SIFRA na serveru.
+ADMIN_SIFRA = os.environ.get("RELAY_ADMIN_SIFRA", "PROMIJENI_OVU_SIFRU")
+
 # Trajna baza (radovi/rezultati učenika) — odvojena od gornjeg efemernog stanja.
 # Isti disk kao i SNAPSHOT_FILE (npr. Render persistent disk), pa preživljava restart.
 DB_FILE = os.environ.get("RELAY_DB", "relay_podaci.db")
@@ -143,6 +148,20 @@ def _db_init():
                 kreirano     TEXT
             )
         """)
+        # Pojedinačni profesori — svako ima svoje ime/prezime i SVOJU LIČNU
+        # šifru (odvojeno od bilo koje zajedničke šifre škole), tako da jedan
+        # profesor ne može obrisati radove/učenike koji pripadaju kodu
+        # (učionici) drugog profesora, čak i u dijeljenoj školi.
+        konn.execute("""
+            CREATE TABLE IF NOT EXISTS profesori (
+                profesor_id  TEXT PRIMARY KEY,
+                ime_prezime  TEXT NOT NULL,
+                sifra_hash   TEXT NOT NULL,
+                skolski_kod  TEXT DEFAULT '',
+                kreiran      TEXT,
+                UNIQUE(skolski_kod, ime_prezime)
+            )
+        """)
         # Ručna odluka profesora o statusu "završio" po učeniku (nadjačava
         # ono što učenikova aplikacija sama izračuna). Trajno se pamti po
         # (kod, ucenik_id) i primjenjuje se i na živi prikaz i na trajno
@@ -176,6 +195,30 @@ def _db_init():
             CREATE INDEX IF NOT EXISTS idx_greske_kod_ucenik
             ON greske_log (kod, ucenik_id)
         """)
+        # Ručno dodijeljeno odjeljenje/folder učenika unutar formativnog
+        # praćenja (npr. "2.1", "2.2") — nezavisno od "razred" polja iz
+        # samih radova. Ključ je identifikator institucije (skolski_kod za
+        # dijeljenu školu, inače sam kod) + ime učenika.
+        konn.execute("""
+            CREATE TABLE IF NOT EXISTS odjeljenja_ucenika (
+                identifikator  TEXT NOT NULL,
+                ucenik_ime     TEXT NOT NULL,
+                odjeljenje     TEXT NOT NULL,
+                PRIMARY KEY (identifikator, ucenik_ime)
+            )
+        """)
+        # Verzije programa (bookify.py / profesori.py) — za auto-update. Sadrži
+        # čitav fajl (base64) svake objavljene verzije; klijenti provjeravaju
+        # svoju verziju protiv ove i sami se ažuriraju ako postoji novija.
+        konn.execute("""
+            CREATE TABLE IF NOT EXISTS verzije (
+                app         TEXT PRIMARY KEY,
+                verzija     TEXT NOT NULL,
+                sadrzaj_b64 TEXT NOT NULL,
+                napomene    TEXT DEFAULT '',
+                objavljeno  TEXT
+            )
+        """)
         # Migracije za baze napravljene prije uvođenja šifre/institucija.
         for _alter in (
             "ALTER TABLE ucionice ADD COLUMN sifra_hash TEXT DEFAULT ''",
@@ -186,6 +229,8 @@ def _db_init():
             "ALTER TABLE radovi ADD COLUMN oblast TEXT DEFAULT ''",
             "ALTER TABLE radovi ADD COLUMN planirani_broj_promjena INTEGER",
             "ALTER TABLE radovi ADD COLUMN preskocene_promjene TEXT DEFAULT ''",
+            "ALTER TABLE ucionice ADD COLUMN profesor_id TEXT DEFAULT ''",
+            "ALTER TABLE ucionice ADD COLUMN profesor_ime TEXT DEFAULT ''",
         ):
             try:
                 konn.execute(_alter)
@@ -195,6 +240,109 @@ def _db_init():
 
 def _upisi_hash(sol, sifra):
     return hashlib.sha256(f"{sol}:{sifra or ''}".encode("utf-8")).hexdigest()
+
+
+def _uporedi_verzije(v1, v2):
+    """Vraća 1 ako je v1 > v2, -1 ako je v1 < v2, 0 ako su jednake.
+    Podržava proizvoljan broj dijelova odvojenih tačkom (npr. '1.2.10')."""
+    def _dijelovi(v):
+        out = []
+        for dio in (v or "0").split("."):
+            try:
+                out.append(int(dio))
+            except ValueError:
+                out.append(0)
+        return out
+    a, b = _dijelovi(v1), _dijelovi(v2)
+    duzina = max(len(a), len(b))
+    a += [0] * (duzina - len(a))
+    b += [0] * (duzina - len(b))
+    if a > b:
+        return 1
+    if a < b:
+        return -1
+    return 0
+
+
+def _db_objavi_verziju(app, verzija, sadrzaj_b64, napomene=""):
+    with _db_lock, _db_konekcija() as konn:
+        konn.execute("""
+            INSERT INTO verzije (app, verzija, sadrzaj_b64, napomene, objavljeno)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(app) DO UPDATE SET
+                verzija = excluded.verzija, sadrzaj_b64 = excluded.sadrzaj_b64,
+                napomene = excluded.napomene, objavljeno = excluded.objavljeno
+        """, (app, verzija, sadrzaj_b64, napomene or "",
+              datetime.now().isoformat(timespec="seconds")))
+
+
+def _db_najnovija_verzija(app):
+    with _db_lock, _db_konekcija() as konn:
+        konn.row_factory = sqlite3.Row
+        return konn.execute(
+            "SELECT verzija, napomene, objavljeno FROM verzije WHERE app = ?", (app,)
+        ).fetchone()
+
+
+def _db_preuzmi_verziju(app):
+    with _db_lock, _db_konekcija() as konn:
+        konn.row_factory = sqlite3.Row
+        return konn.execute(
+            "SELECT verzija, sadrzaj_b64 FROM verzije WHERE app = ?", (app,)
+        ).fetchone()
+    """'Prijava' profesora unutar (dijeljene ili solo) škole: ako profesor s
+    tim imenom već postoji u toj školi, provjerava se lična šifra (mora se
+    poklapati — inače drugi profesor ne bi mogao da 'preuzme' tuđe ime); ako
+    ne postoji, pravi se nov profesor s tom šifrom.
+    Vraća (profesor_id, None) na uspjeh, ili (None, poruka_greske) na neuspjeh."""
+    import uuid as _uuid
+    ime_prezime = (ime_prezime or "").strip()
+    if not ime_prezime or not sifra:
+        return None, "Ime i prezime i lična šifra su obavezni."
+    with _db_lock, _db_konekcija() as konn:
+        konn.row_factory = sqlite3.Row
+        red = konn.execute(
+            "SELECT profesor_id, sifra_hash FROM profesori WHERE skolski_kod = ? AND ime_prezime = ?",
+            (skolski_kod or "", ime_prezime)).fetchone()
+        novi_hash = _upisi_hash(f"prof:{skolski_kod or ''}:{ime_prezime}", sifra)
+        if red:
+            if red["sifra_hash"] != novi_hash:
+                return None, ("Postoji profesor s tim imenom u ovoj školi, ali šifra "
+                               "se ne poklapa. Unesite tačnu ličnu šifru tog profesora, "
+                               "ili koristite drugo ime.")
+            return red["profesor_id"], None
+        profesor_id = str(_uuid.uuid4())
+        konn.execute("""
+            INSERT INTO profesori (profesor_id, ime_prezime, sifra_hash, skolski_kod, kreiran)
+            VALUES (?, ?, ?, ?, ?)
+        """, (profesor_id, ime_prezime, novi_hash, skolski_kod or "",
+              datetime.now().isoformat(timespec="seconds")))
+        return profesor_id, None
+
+
+def _db_poveži_profesora_kodom(kod, profesor_id, ime_prezime):
+    with _db_lock, _db_konekcija() as konn:
+        konn.execute(
+            "UPDATE ucionice SET profesor_id = ?, profesor_ime = ? WHERE kod = ?",
+            (profesor_id or "", ime_prezime or "", kod))
+
+
+def _kodovi_profesora(konn, kod):
+    """Kodovi (učionice) koje pripadaju ISTOM profesoru kao dati kod — za
+    brisanje se NIKAD ne izlazi izvan ovog skupa, čak ni u dijeljenoj školi,
+    da jedan profesor ne bi mogao obrisati podatke drugog. Ako kod nema
+    registrovanog profesora (stariji, prije uvođenja ovog sistema), koristi
+    se samo taj jedan kod (nikad cijela institucija) — sigurnije podrazumijevano.
+    """
+    konn.row_factory = sqlite3.Row
+    red = konn.execute(
+        "SELECT profesor_id FROM ucionice WHERE kod = ?", (kod,)).fetchone()
+    profesor_id = (red["profesor_id"] if red else "") or ""
+    if not profesor_id:
+        return [kod]
+    kodovi = [r[0] for r in konn.execute(
+        "SELECT kod FROM ucionice WHERE profesor_id = ?", (profesor_id,)).fetchall()]
+    return kodovi or [kod]
 
 
 def _generisi_skolski_kod(konn):
@@ -216,7 +364,8 @@ def _povezanost_koda(konn, kod):
     """Vraća red iz ucionice za dati kod (ili None)."""
     konn.row_factory = sqlite3.Row
     return konn.execute(
-        "SELECT grad, skola, sifra_hash, skolski_kod FROM ucionice WHERE kod = ?", (kod,)
+        "SELECT grad, skola, sifra_hash, skolski_kod, profesor_id, profesor_ime "
+        "FROM ucionice WHERE kod = ?", (kod,)
     ).fetchone()
 
 
@@ -233,16 +382,22 @@ def _kodovi_za_upit(konn, kod):
 
 
 def _provjeri_sifru(kod, sifra):
-    """Vraća True samo ako je šifra tačna — protiv institucije (dijeljena škola)
-    ako je kod pridružen jednoj, inače protiv šifre samog koda (solo način).
-    Ako šifra još nije postavljena nigdje, brisanje se odbija."""
+    """Vraća True samo ako je šifra tačna. Ako je kod registrovan pod nekim
+    profesorom (novi sistem), provjerava se LIČNA šifra TOG profesora — ne
+    zajednička šifra škole — tako da drugi profesor u istoj (dijeljenoj)
+    školi ne može obrisati njegove podatke ni kad zna šifru škole.
+    Za starije kodove bez registrovanog profesora, koristi se stari sistem
+    (zajednička šifra škole ili šifra samog koda)."""
     with _db_lock, _db_konekcija() as konn:
+        konn.row_factory = sqlite3.Row
         red = _povezanost_koda(konn, kod)
         if not red:
             return False
+        profesor_id = (red["profesor_id"] or "") if red else ""
+        if profesor_id:
+            return _provjeri_licnu_sifru_profesora(profesor_id, sifra)
         skolski_kod = (red["skolski_kod"] or "")
         if skolski_kod:
-            konn.row_factory = sqlite3.Row
             inst = konn.execute(
                 "SELECT sifra_hash FROM institucije WHERE skolski_kod = ?", (skolski_kod,)
             ).fetchone()
@@ -254,6 +409,18 @@ def _provjeri_sifru(kod, sifra):
         if not sacuvani:
             return False
         return _upisi_hash(kod, sifra) == sacuvani
+
+
+def _provjeri_licnu_sifru_profesora(profesor_id, sifra):
+    with _db_lock, _db_konekcija() as konn:
+        konn.row_factory = sqlite3.Row
+        prof = konn.execute(
+            "SELECT sifra_hash, skolski_kod, ime_prezime FROM profesori WHERE profesor_id = ?",
+            (profesor_id,)).fetchone()
+        if not prof:
+            return False
+        ocekivani = _upisi_hash(f"prof:{prof['skolski_kod'] or ''}:{prof['ime_prezime']}", sifra)
+        return ocekivani == prof["sifra_hash"]
 
 
 def _db_postavi_skolu(kod, grad=None, skola=None, sifra_hash=None):
@@ -329,7 +496,7 @@ def _db_napusti_skolu(kod):
 
 def _db_obrisi_rad(rad_id, kod):
     with _db_lock, _db_konekcija() as konn:
-        kodovi, _ = _kodovi_za_upit(konn, kod)
+        kodovi = _kodovi_profesora(konn, kod)
         upitnici = ",".join("?" * len(kodovi))
         cur = konn.execute(
             f"DELETE FROM radovi WHERE id = ? AND kod IN ({upitnici})", [rad_id] + kodovi)
@@ -338,7 +505,7 @@ def _db_obrisi_rad(rad_id, kod):
 
 def _db_obrisi_ucenika(kod, ucenik_ime):
     with _db_lock, _db_konekcija() as konn:
-        kodovi, _ = _kodovi_za_upit(konn, kod)
+        kodovi = _kodovi_profesora(konn, kod)
         upitnici = ",".join("?" * len(kodovi))
         cur = konn.execute(
             f"DELETE FROM radovi WHERE kod IN ({upitnici}) AND ucenik_ime = ?",
@@ -529,6 +696,41 @@ def _db_detalji(rad_id):
         return d
 
 
+def _identifikator_institucije(konn, kod):
+    """Ključ za grupisanje kroz cijelu (dijeljenu) školu — skolski_kod ako
+    kod pripada dijeljenoj instituciji, inače sam kod (solo način)."""
+    red = _povezanost_koda(konn, kod)
+    skolski_kod = (red["skolski_kod"] if red else "") or ""
+    return skolski_kod or kod
+
+
+def _db_postavi_odjeljenje(kod, ucenik_ime, odjeljenje):
+    """Profesor ručno dodjeljuje učenika u odjeljenje/folder (npr. '2.1').
+    Prazan odjeljenje briše dodjelu (učenik se vraća pod grupisanje po
+    'razred' polju iz radova)."""
+    with _db_lock, _db_konekcija() as konn:
+        ident = _identifikator_institucije(konn, kod)
+        if odjeljenje:
+            konn.execute("""
+                INSERT INTO odjeljenja_ucenika (identifikator, ucenik_ime, odjeljenje)
+                VALUES (?, ?, ?)
+                ON CONFLICT(identifikator, ucenik_ime) DO UPDATE SET
+                    odjeljenje = excluded.odjeljenje
+            """, (ident, ucenik_ime, odjeljenje))
+        else:
+            konn.execute(
+                "DELETE FROM odjeljenja_ucenika WHERE identifikator = ? AND ucenik_ime = ?",
+                (ident, ucenik_ime))
+
+
+def _db_sva_odjeljenja(konn, ident):
+    """{ucenik_ime: odjeljenje} za dati identifikator institucije."""
+    redovi = konn.execute(
+        "SELECT ucenik_ime, odjeljenje FROM odjeljenja_ucenika WHERE identifikator = ?",
+        (ident,)).fetchall()
+    return {r[0]: r[1] for r in redovi}
+
+
 def _db_statistika(kod):
     with _db_lock, _db_konekcija() as konn:
         konn.row_factory = sqlite3.Row
@@ -566,14 +768,20 @@ def _db_statistika(kod):
             GROUP BY razred, ucenik_ime
             ORDER BY razred ASC, poslednji_put DESC
         """, kodovi).fetchall()
+
+        ident = skolski_kod or kod
+        odjeljenja_map = _db_sva_odjeljenja(konn, ident)
+
         po_razredu_map = {}
         redoslijed = []
         for r in redovi:
-            rz = r["razred"]
+            rz = odjeljenja_map.get(r["ucenik_ime"]) or r["razred"]
             if rz not in po_razredu_map:
                 po_razredu_map[rz] = []
                 redoslijed.append(rz)
-            po_razredu_map[rz].append(dict(r))
+            red_dict = dict(r)
+            red_dict["odjeljenje_dodijeljeno"] = r["ucenik_ime"] in odjeljenja_map
+            po_razredu_map[rz].append(red_dict)
         return {
             "kod": kod,
             "grad": grad,
@@ -709,6 +917,44 @@ class RelayHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
 
+        # Auto-update: klijent (bookify.py / profesori.py) provjerava da li
+        # postoji novija verzija na serveru. GET /provjeri_update?app=bookify&verzija=1.0.0
+        elif path == "/provjeri_update":
+            app = (params.get("app", [""])[0] or "").strip()
+            verzija = (params.get("verzija", ["0"])[0] or "0").strip()
+            if not app:
+                self._json({"greska": "Nedostaje app"}, 400)
+                return
+            try:
+                red = _db_najnovija_verzija(app)
+                if not red:
+                    self._json({"dostupno": False})
+                    return
+                dostupno = _uporedi_verzije(red["verzija"], verzija) > 0
+                self._json({
+                    "dostupno": dostupno,
+                    "nova_verzija": red["verzija"],
+                    "napomene": red["napomene"] or "",
+                })
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
+        # Auto-update: klijent preuzima sadržaj novije verzije.
+        # GET /preuzmi_update?app=bookify
+        elif path == "/preuzmi_update":
+            app = (params.get("app", [""])[0] or "").strip()
+            if not app:
+                self._json({"greska": "Nedostaje app"}, 400)
+                return
+            try:
+                red = _db_preuzmi_verziju(app)
+                if not red:
+                    self._json({"greska": "Nema objavljene verzije za taj program."}, 404)
+                    return
+                self._json({"verzija": red["verzija"], "sadrzaj_b64": red["sadrzaj_b64"]})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
         else:
             self._json({"greska": "Not found"}, 404)
 
@@ -801,6 +1047,27 @@ class RelayHandler(BaseHTTPRequestHandler):
                     oblast=data.get("oblast", ""),
                     tip=data.get("tip", "ostalo"))
                 self._json({"status": "ok"})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
+        # ADMIN: objavljivanje nove verzije programa (bookify.py / profesori.py)
+        # — SAMO ti (developer) treba da koristiš ovo, sa svojom ADMIN_SIFRA.
+        # POST /admin/objavi_update {app, verzija, sadrzaj_b64, admin_sifra, napomene}
+        elif path == "/admin/objavi_update":
+            admin_sifra = str(data.get("admin_sifra", ""))
+            if admin_sifra != ADMIN_SIFRA:
+                self._json({"greska": "Pogrešna admin šifra."}, 403)
+                return
+            app = str(data.get("app", "")).strip()
+            verzija = str(data.get("verzija", "")).strip()
+            sadrzaj_b64 = data.get("sadrzaj_b64", "")
+            napomene = str(data.get("napomene", ""))
+            if app not in ("bookify", "profesori") or not verzija or not sadrzaj_b64:
+                self._json({"greska": "Nedostaje app, verzija ili sadržaj."}, 400)
+                return
+            try:
+                _db_objavi_verziju(app, verzija, sadrzaj_b64, napomene)
+                self._json({"status": "ok", "app": app, "verzija": verzija})
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
 
@@ -912,45 +1179,77 @@ class RelayHandler(BaseHTTPRequestHandler):
         elif path == "/postavi_sifru":
             kod = str(data.get("classroom_kod", "")).strip().upper()
             sifra = str(data.get("sifra", ""))
+            ime_prezime = str(data.get("ime_prezime", "")).strip()
+            licna_sifra = str(data.get("licna_sifra", ""))
             if not kod or not sifra:
                 self._json({"greska": "Nedostaje kod ili šifra"}, 400)
                 return
             try:
                 _db_postavi_skolu(kod, sifra_hash=_upisi_hash(kod, sifra))
+                if ime_prezime and licna_sifra:
+                    profesor_id, greska = _db_prijava_profesora("", ime_prezime, licna_sifra)
+                    if greska:
+                        self._json({"greska": greska}, 403)
+                        return
+                    _db_poveži_profesora_kodom(kod, profesor_id, ime_prezime)
                 self._json({"status": "ok"})
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
 
         # Nastavnik pravi NOVU dijeljenu školu (instituciju) — generiše se
         # skolski_kod koji se daje kolegama da se pridruže istoj istoriji.
+        # Svaki nastavnik MORA prijaviti ime/prezime i ličnu šifru — ta lična
+        # šifra (ne šifra škole) štiti njegove podatke od brisanja od strane
+        # drugih nastavnika u istoj školi.
         elif path == "/napravi_skolu":
             kod   = str(data.get("classroom_kod", "")).strip().upper()
             grad  = str(data.get("grad", "")).strip()
             skola = str(data.get("skola", "")).strip()
             sifra = str(data.get("sifra", ""))
+            ime_prezime = str(data.get("ime_prezime", "")).strip()
+            licna_sifra = str(data.get("licna_sifra", ""))
             if not kod or not grad or not skola or not sifra:
                 self._json({"greska": "Nedostaje kod, grad, škola ili šifra"}, 400)
                 return
+            if not ime_prezime or not licna_sifra:
+                self._json({"greska": "Nedostaje ime/prezime ili lična šifra profesora"}, 400)
+                return
             try:
                 skolski_kod = _db_napravi_instituciju(kod, grad, skola, sifra)
+                profesor_id, greska = _db_prijava_profesora(skolski_kod, ime_prezime, licna_sifra)
+                if greska:
+                    self._json({"greska": greska}, 403)
+                    return
+                _db_poveži_profesora_kodom(kod, profesor_id, ime_prezime)
                 self._json({"status": "ok", "skolski_kod": skolski_kod})
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
 
         # Nastavnik se pridružuje POSTOJEĆOJ dijeljenoj školi — treba školski_kod
-        # i šifru koje mu je dao kolega koji je školu napravio.
+        # i šifru koje mu je dao kolega koji je školu napravio, PLUS svoje ime/
+        # prezime i ličnu šifru (novu, ili istu ako se prijavljuje ponovo).
         elif path == "/pridruzi_skoli":
             kod         = str(data.get("classroom_kod", "")).strip().upper()
             skolski_kod = str(data.get("skolski_kod", "")).strip().upper()
             sifra       = str(data.get("sifra", ""))
+            ime_prezime = str(data.get("ime_prezime", "")).strip()
+            licna_sifra = str(data.get("licna_sifra", ""))
             if not kod or not skolski_kod:
                 self._json({"greska": "Nedostaje kod ili školski kod"}, 400)
+                return
+            if not ime_prezime or not licna_sifra:
+                self._json({"greska": "Nedostaje ime/prezime ili lična šifra profesora"}, 400)
                 return
             try:
                 uspjeh, grad, skola = _db_pridruzi_skoli(kod, skolski_kod, sifra)
                 if not uspjeh:
                     self._json({"greska": "Školski kod ili šifra nisu ispravni."}, 403)
                     return
+                profesor_id, greska = _db_prijava_profesora(skolski_kod, ime_prezime, licna_sifra)
+                if greska:
+                    self._json({"greska": greska}, 403)
+                    return
+                _db_poveži_profesora_kodom(kod, profesor_id, ime_prezime)
                 self._json({"status": "ok", "grad": grad, "skola": skola})
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
@@ -985,6 +1284,22 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self._json({"greska": f"Greška baze: {e}"}, 500)
 
         # Brisanje svih sačuvanih radova jednog učenika — zahtijeva šifru.
+        # Profesor ručno prebacuje učenika u odjeljenje/folder (formativno
+        # praćenje), npr. "2.1", "2.2" — nezavisno od 'razred' polja radova.
+        # Prazan "odjeljenje" briše dodjelu.
+        elif path == "/postavi_odjeljenje":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            ucenik_ime = str(data.get("ucenik_ime", "")).strip()
+            odjeljenje = str(data.get("odjeljenje", "")).strip()
+            if not kod or not ucenik_ime:
+                self._json({"greska": "Nedostaje kod ili ucenik_ime"}, 400)
+                return
+            try:
+                _db_postavi_odjeljenje(kod, ucenik_ime, odjeljenje)
+                self._json({"status": "ok"})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
         elif path == "/obrisi_ucenika":
             kod = str(data.get("classroom_kod", "")).strip().upper()
             sifra = str(data.get("sifra", ""))
