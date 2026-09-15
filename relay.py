@@ -109,7 +109,10 @@ def _db_init():
                 zavrsio       INTEGER DEFAULT 0,
                 podaci        TEXT NOT NULL,
                 sesija_id     TEXT DEFAULT '',
-                ucenik_id     TEXT DEFAULT ''
+                ucenik_id     TEXT DEFAULT '',
+                oblast        TEXT DEFAULT '',
+                planirani_broj_promjena INTEGER,
+                preskocene_promjene TEXT DEFAULT ''
             )
         """)
         konn.execute("""
@@ -180,6 +183,9 @@ def _db_init():
             "ALTER TABLE greske_log ADD COLUMN ucenik_ime TEXT DEFAULT ''",
             "ALTER TABLE radovi ADD COLUMN sesija_id TEXT DEFAULT ''",
             "ALTER TABLE radovi ADD COLUMN ucenik_id TEXT DEFAULT ''",
+            "ALTER TABLE radovi ADD COLUMN oblast TEXT DEFAULT ''",
+            "ALTER TABLE radovi ADD COLUMN planirani_broj_promjena INTEGER",
+            "ALTER TABLE radovi ADD COLUMN preskocene_promjene TEXT DEFAULT ''",
         ):
             try:
                 konn.execute(_alter)
@@ -342,13 +348,15 @@ def _db_obrisi_ucenika(kod, ucenik_ime):
 
 def _db_sacuvaj_rad(kod, ucenik_ime, razred, promet_dug, promet_pot,
                      broj_gresaka, zavrsio, podaci_dict, ucenik_id=None,
-                     sesija_id=None):
+                     sesija_id=None, oblast='', planirani_broj_promjena=None,
+                     preskocene_promjene=None):
     """Sačuva rad učenika. Ako je poslat sesija_id i već postoji rad iz iste
     sesije (tj. učenik nije izašao i ponovo ušao u program), AŽURIRA se
     postojeći red umjesto da se pravi novi — jedan red = jedan primjer/
     pokušaj. Nova sesija (novo pokretanje programa) uvijek pravi novi red."""
     vrijeme = datetime.now().isoformat(timespec="seconds")
     podaci_json = json.dumps(podaci_dict, ensure_ascii=False)
+    preskocene_json = json.dumps(preskocene_promjene or [], ensure_ascii=False)
     with _db_lock, _db_konekcija() as konn:
         # Ako profesor ima ručno postavljen status za ovog učenika, on ima
         # prednost nad onim što učenikova aplikacija sama izračuna.
@@ -371,20 +379,24 @@ def _db_sacuvaj_rad(kod, ucenik_ime, razred, promet_dug, promet_pot,
         if postojeci_id:
             konn.execute("""
                 UPDATE radovi SET ucenik_ime=?, razred=?, vrijeme=?, promet_dug=?,
-                       promet_pot=?, broj_gresaka=?, zavrsio=?, podaci=?
+                       promet_pot=?, broj_gresaka=?, zavrsio=?, podaci=?,
+                       oblast=?, planirani_broj_promjena=?, preskocene_promjene=?
                 WHERE id=?
             """, (ucenik_ime, razred, vrijeme, promet_dug or 0, promet_pot or 0,
-                  broj_gresaka or 0, 1 if zavrsio else 0, podaci_json, postojeci_id))
+                  broj_gresaka or 0, 1 if zavrsio else 0, podaci_json,
+                  oblast or '', planirani_broj_promjena, preskocene_json, postojeci_id))
             return postojeci_id
 
         cur = konn.execute("""
             INSERT INTO radovi (kod, ucenik_ime, razred, vrijeme, promet_dug,
                                  promet_pot, broj_gresaka, zavrsio, podaci,
-                                 sesija_id, ucenik_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 sesija_id, ucenik_id, oblast, planirani_broj_promjena,
+                                 preskocene_promjene)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (kod, ucenik_ime, razred, vrijeme, promet_dug or 0, promet_pot or 0,
               broj_gresaka or 0, 1 if zavrsio else 0, podaci_json,
-              sesija_id or '', ucenik_id or ''))
+              sesija_id or '', ucenik_id or '', oblast or '', planirani_broj_promjena,
+              preskocene_json))
         return cur.lastrowid
 
 
@@ -479,18 +491,28 @@ def _db_istorija(kod, ucenik_ime=None):
         if ucenik_ime:
             redovi = konn.execute(f"""
                 SELECT id, kod, ucenik_ime, razred, vrijeme, promet_dug,
-                       promet_pot, broj_gresaka, zavrsio
+                       promet_pot, broj_gresaka, zavrsio, oblast, planirani_broj_promjena,
+                       preskocene_promjene
                 FROM radovi WHERE kod IN ({upitnici}) AND ucenik_ime = ?
                 ORDER BY vrijeme DESC
             """, kodovi + [ucenik_ime]).fetchall()
         else:
             redovi = konn.execute(f"""
                 SELECT id, kod, ucenik_ime, razred, vrijeme, promet_dug,
-                       promet_pot, broj_gresaka, zavrsio
+                       promet_pot, broj_gresaka, zavrsio, oblast, planirani_broj_promjena,
+                       preskocene_promjene
                 FROM radovi WHERE kod IN ({upitnici})
                 ORDER BY vrijeme DESC
             """, kodovi).fetchall()
-        return [dict(r) for r in redovi]
+        rezultat = []
+        for r in redovi:
+            d = dict(r)
+            try:
+                d["preskocene_promjene"] = json.loads(d.get("preskocene_promjene") or "[]")
+            except Exception:
+                d["preskocene_promjene"] = []
+            rezultat.append(d)
+        return rezultat
 
 
 def _db_detalji(rad_id):
@@ -747,11 +769,18 @@ class RelayHandler(BaseHTTPRequestHandler):
                 return
             with lock:
                 kljuc = _kljuc_zadatka(kod, ucenik_id if ucenik_id else None)
-                if tekst:
-                    zadaci[kljuc] = {"tekst": tekst, "tip": tip, "oblast": oblast,
-                                      "broj_promjena": broj_promjena, "vrijeme": time.time()}
+                if tekst or oblast or broj_promjena is not None:
+                    postojeci = zadaci.get(kljuc, {})
+                    zadaci[kljuc] = {
+                        "tekst": tekst if tekst else postojeci.get("tekst", ""),
+                        "tip": tip,
+                        "oblast": oblast if oblast else postojeci.get("oblast", ""),
+                        "broj_promjena": (broj_promjena if broj_promjena is not None
+                                          else postojeci.get("broj_promjena")),
+                        "vrijeme": time.time(),
+                    }
                 else:
-                    zadaci.pop(kljuc, None)  # Obriši — globalni (ako postoji) dobija prednost
+                    zadaci.pop(kljuc, None)  # Ništa poslano — obriši (globalni dobija prednost)
             self._json({"status": "ok"})
 
         # Ucenik prijavljuje klasifikovanu grešku (formativno praćenje):
@@ -854,6 +883,9 @@ class RelayHandler(BaseHTTPRequestHandler):
                     podaci_dict=data.get("podaci", {}),
                     ucenik_id=str(data.get("ucenik_id", "")).strip() or None,
                     sesija_id=str(data.get("sesija_id", "")).strip() or None,
+                    oblast=str(data.get("oblast", "")).strip(),
+                    planirani_broj_promjena=data.get("planirani_broj_promjena"),
+                    preskocene_promjene=data.get("preskocene_promjene", []),
                 )
                 self._json({"status": "ok", "id": novi_id})
             except Exception as e:
