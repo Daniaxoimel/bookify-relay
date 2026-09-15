@@ -107,7 +107,9 @@ def _db_init():
                 promet_pot    REAL DEFAULT 0,
                 broj_gresaka  INTEGER DEFAULT 0,
                 zavrsio       INTEGER DEFAULT 0,
-                podaci        TEXT NOT NULL
+                podaci        TEXT NOT NULL,
+                sesija_id     TEXT DEFAULT '',
+                ucenik_id     TEXT DEFAULT ''
             )
         """)
         konn.execute("""
@@ -176,6 +178,8 @@ def _db_init():
             "ALTER TABLE ucionice ADD COLUMN sifra_hash TEXT DEFAULT ''",
             "ALTER TABLE ucionice ADD COLUMN skolski_kod TEXT DEFAULT ''",
             "ALTER TABLE greske_log ADD COLUMN ucenik_ime TEXT DEFAULT ''",
+            "ALTER TABLE radovi ADD COLUMN sesija_id TEXT DEFAULT ''",
+            "ALTER TABLE radovi ADD COLUMN ucenik_id TEXT DEFAULT ''",
         ):
             try:
                 konn.execute(_alter)
@@ -337,7 +341,12 @@ def _db_obrisi_ucenika(kod, ucenik_ime):
 
 
 def _db_sacuvaj_rad(kod, ucenik_ime, razred, promet_dug, promet_pot,
-                     broj_gresaka, zavrsio, podaci_dict, ucenik_id=None):
+                     broj_gresaka, zavrsio, podaci_dict, ucenik_id=None,
+                     sesija_id=None):
+    """Sačuva rad učenika. Ako je poslat sesija_id i već postoji rad iz iste
+    sesije (tj. učenik nije izašao i ponovo ušao u program), AŽURIRA se
+    postojeći red umjesto da se pravi novi — jedan red = jedan primjer/
+    pokušaj. Nova sesija (novo pokretanje programa) uvijek pravi novi red."""
     vrijeme = datetime.now().isoformat(timespec="seconds")
     podaci_json = json.dumps(podaci_dict, ensure_ascii=False)
     with _db_lock, _db_konekcija() as konn:
@@ -349,12 +358,33 @@ def _db_sacuvaj_rad(kod, ucenik_ime, razred, promet_dug, promet_pot,
                 (kod, ucenik_id)).fetchone()
             if red is not None:
                 zavrsio = bool(red[0])
+
+        postojeci_id = None
+        if sesija_id and ucenik_id:
+            red = konn.execute("""
+                SELECT id FROM radovi
+                WHERE kod = ? AND ucenik_id = ? AND sesija_id = ?
+            """, (kod, ucenik_id, sesija_id)).fetchone()
+            if red:
+                postojeci_id = red[0]
+
+        if postojeci_id:
+            konn.execute("""
+                UPDATE radovi SET ucenik_ime=?, razred=?, vrijeme=?, promet_dug=?,
+                       promet_pot=?, broj_gresaka=?, zavrsio=?, podaci=?
+                WHERE id=?
+            """, (ucenik_ime, razred, vrijeme, promet_dug or 0, promet_pot or 0,
+                  broj_gresaka or 0, 1 if zavrsio else 0, podaci_json, postojeci_id))
+            return postojeci_id
+
         cur = konn.execute("""
             INSERT INTO radovi (kod, ucenik_ime, razred, vrijeme, promet_dug,
-                                 promet_pot, broj_gresaka, zavrsio, podaci)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 promet_pot, broj_gresaka, zavrsio, podaci,
+                                 sesija_id, ucenik_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (kod, ucenik_ime, razred, vrijeme, promet_dug or 0, promet_pot or 0,
-              broj_gresaka or 0, 1 if zavrsio else 0, podaci_json))
+              broj_gresaka or 0, 1 if zavrsio else 0, podaci_json,
+              sesija_id or '', ucenik_id or ''))
         return cur.lastrowid
 
 
@@ -823,6 +853,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     zavrsio=data.get("zavrsio", False),
                     podaci_dict=data.get("podaci", {}),
                     ucenik_id=str(data.get("ucenik_id", "")).strip() or None,
+                    sesija_id=str(data.get("sesija_id", "")).strip() or None,
                 )
                 self._json({"status": "ok", "id": novi_id})
             except Exception as e:
