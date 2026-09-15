@@ -215,6 +215,7 @@ def _db_init():
                 app         TEXT PRIMARY KEY,
                 verzija     TEXT NOT NULL,
                 sadrzaj_b64 TEXT NOT NULL,
+                sha256      TEXT DEFAULT '',
                 napomene    TEXT DEFAULT '',
                 objavljeno  TEXT
             )
@@ -231,6 +232,7 @@ def _db_init():
             "ALTER TABLE radovi ADD COLUMN preskocene_promjene TEXT DEFAULT ''",
             "ALTER TABLE ucionice ADD COLUMN profesor_id TEXT DEFAULT ''",
             "ALTER TABLE ucionice ADD COLUMN profesor_ime TEXT DEFAULT ''",
+            "ALTER TABLE verzije ADD COLUMN sha256 TEXT DEFAULT ''",
         ):
             try:
                 konn.execute(_alter)
@@ -264,15 +266,16 @@ def _uporedi_verzije(v1, v2):
     return 0
 
 
-def _db_objavi_verziju(app, verzija, sadrzaj_b64, napomene=""):
+def _db_objavi_verziju(app, verzija, sadrzaj_b64, napomene="", sha256=""):
     with _db_lock, _db_konekcija() as konn:
         konn.execute("""
-            INSERT INTO verzije (app, verzija, sadrzaj_b64, napomene, objavljeno)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO verzije (app, verzija, sadrzaj_b64, sha256, napomene, objavljeno)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(app) DO UPDATE SET
                 verzija = excluded.verzija, sadrzaj_b64 = excluded.sadrzaj_b64,
+                sha256 = excluded.sha256,
                 napomene = excluded.napomene, objavljeno = excluded.objavljeno
-        """, (app, verzija, sadrzaj_b64, napomene or "",
+        """, (app, verzija, sadrzaj_b64, sha256 or "", napomene or "",
               datetime.now().isoformat(timespec="seconds")))
 
 
@@ -288,7 +291,7 @@ def _db_preuzmi_verziju(app):
     with _db_lock, _db_konekcija() as konn:
         konn.row_factory = sqlite3.Row
         return konn.execute(
-            "SELECT verzija, sadrzaj_b64 FROM verzije WHERE app = ?", (app,)
+            "SELECT verzija, sadrzaj_b64, sha256 FROM verzije WHERE app = ?", (app,)
         ).fetchone()
     """'Prijava' profesora unutar (dijeljene ili solo) škole: ako profesor s
     tim imenom već postoji u toj školi, provjerava se lična šifra (mora se
@@ -951,7 +954,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                 if not red:
                     self._json({"greska": "Nema objavljene verzije za taj program."}, 404)
                     return
-                self._json({"verzija": red["verzija"], "sadrzaj_b64": red["sadrzaj_b64"]})
+                self._json({"verzija": red["verzija"], "sadrzaj_b64": red["sadrzaj_b64"],
+                            "sha256": red["sha256"] or ""})
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
 
@@ -1062,11 +1066,21 @@ class RelayHandler(BaseHTTPRequestHandler):
             verzija = str(data.get("verzija", "")).strip()
             sadrzaj_b64 = data.get("sadrzaj_b64", "")
             napomene = str(data.get("napomene", ""))
+            sha256 = str(data.get("sha256", ""))
             if app not in ("bookify", "profesori") or not verzija or not sadrzaj_b64:
                 self._json({"greska": "Nedostaje app, verzija ili sadržaj."}, 400)
                 return
             try:
-                _db_objavi_verziju(app, verzija, sadrzaj_b64, napomene)
+                # Server-side provjera cjelovitosti onoga što je primljeno —
+                # ako se otisak ne poklapa (npr. prekinut upload), odbij.
+                if sha256:
+                    import base64 as _b64_v, hashlib as _hl_v
+                    stvarni = _hl_v.sha256(_b64_v.b64decode(sadrzaj_b64)).hexdigest()
+                    if stvarni != sha256:
+                        self._json({"greska": "Otisak (sha256) se ne poklapa — upload "
+                                               "je vjerovatno prekinut/oštećen. Pokušaj ponovo."}, 400)
+                        return
+                _db_objavi_verziju(app, verzija, sadrzaj_b64, napomene, sha256)
                 self._json({"status": "ok", "app": app, "verzija": verzija})
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
