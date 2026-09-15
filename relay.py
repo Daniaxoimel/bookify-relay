@@ -293,6 +293,9 @@ def _db_preuzmi_verziju(app):
         return konn.execute(
             "SELECT verzija, sadrzaj_b64, sha256 FROM verzije WHERE app = ?", (app,)
         ).fetchone()
+
+
+def _db_prijava_profesora(skolski_kod, ime_prezime, sifra):
     """'Prijava' profesora unutar (dijeljene ili solo) škole: ako profesor s
     tim imenom već postoji u toj školi, provjerava se lična šifra (mora se
     poklapati — inače drugi profesor ne bi mogao da 'preuzme' tuđe ime); ako
