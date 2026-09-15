@@ -159,6 +159,7 @@ def _db_init():
                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
                 kod                  TEXT NOT NULL,
                 ucenik_id            TEXT NOT NULL,
+                ucenik_ime           TEXT DEFAULT '',
                 datum                TEXT,
                 redni_broj_promjene  TEXT,
                 oblast               TEXT,
@@ -174,6 +175,7 @@ def _db_init():
         for _alter in (
             "ALTER TABLE ucionice ADD COLUMN sifra_hash TEXT DEFAULT ''",
             "ALTER TABLE ucionice ADD COLUMN skolski_kod TEXT DEFAULT ''",
+            "ALTER TABLE greske_log ADD COLUMN ucenik_ime TEXT DEFAULT ''",
         ):
             try:
                 konn.execute(_alter)
@@ -398,21 +400,21 @@ def _db_azuriraj_zadnji_rad_zavrsio(kod, ucenik_ime, zavrsio):
                         (1 if zavrsio else 0, red[0]))
 
 
-def _db_prijavi_gresku(kod, ucenik_id, datum, redni_broj_promjene, oblast, tip):
+def _db_prijavi_gresku(kod, ucenik_id, datum, redni_broj_promjene, oblast, tip, ucenik_ime=""):
     """Ucenikova aplikacija prijavljuje klasifikovanu grešku — bez vremena
     tačnog trenutka, samo datum rada koji šalje učenik."""
     with _db_lock, _db_konekcija() as konn:
         konn.execute("""
-            INSERT INTO greske_log (kod, ucenik_id, datum, redni_broj_promjene,
+            INSERT INTO greske_log (kod, ucenik_id, ucenik_ime, datum, redni_broj_promjene,
                                      oblast, tip, vrijeme)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (kod, ucenik_id, datum or "", str(redni_broj_promjene or ""),
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (kod, ucenik_id, ucenik_ime or "", datum or "", str(redni_broj_promjene or ""),
               oblast or "", tip or "ostalo", time.time()))
 
 
-def _db_greske(kod, ucenik_id=None):
-    """Klasifikovane greške za profesora — po jednom učeniku ili cijelom
-    kodu učionice, najnovije prve."""
+def _db_greske(kod, ucenik_id=None, ucenik_ime=None):
+    """Klasifikovane greške za profesora — po jednom učeniku (preko ucenik_id
+    ili ucenik_ime) ili cijelom kodu učionice, najnovije prve."""
     with _db_lock, _db_konekcija() as konn:
         if ucenik_id:
             redovi = konn.execute("""
@@ -420,6 +422,14 @@ def _db_greske(kod, ucenik_id=None):
                 FROM greske_log WHERE kod = ? AND ucenik_id = ?
                 ORDER BY id DESC
             """, (kod, ucenik_id)).fetchall()
+            return [{"datum": r[0], "redni_broj_promjene": r[1],
+                     "oblast": r[2], "tip": r[3]} for r in redovi]
+        if ucenik_ime:
+            redovi = konn.execute("""
+                SELECT datum, redni_broj_promjene, oblast, tip
+                FROM greske_log WHERE kod = ? AND ucenik_ime = ?
+                ORDER BY id DESC
+            """, (kod, ucenik_ime)).fetchall()
             return [{"datum": r[0], "redni_broj_promjene": r[1],
                      "oblast": r[2], "tip": r[3]} for r in redovi]
         redovi = konn.execute("""
@@ -641,8 +651,9 @@ class RelayHandler(BaseHTTPRequestHandler):
                 self._json({"greska": "Nedostaje kod"}, 400)
                 return
             ucenik_id = (params.get("ucenik_id", [""])[0] or "").strip()
+            ucenik_ime = (params.get("ucenik_ime", [""])[0] or "").strip()
             try:
-                self._json({"greske": _db_greske(kod, ucenik_id or None)})
+                self._json({"greske": _db_greske(kod, ucenik_id or None, ucenik_ime or None)})
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
 
@@ -725,6 +736,7 @@ class RelayHandler(BaseHTTPRequestHandler):
             try:
                 _db_prijavi_gresku(
                     kod=kod, ucenik_id=ucenik_id,
+                    ucenik_ime=str(data.get("ucenik_ime", "")).strip(),
                     datum=data.get("datum", ""),
                     redni_broj_promjene=data.get("redni_broj_promjene", ""),
                     oblast=data.get("oblast", ""),
