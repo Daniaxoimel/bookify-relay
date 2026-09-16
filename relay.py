@@ -1213,6 +1213,31 @@ class RelayHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
 
+        # Prijava profesora NA POSTOJEĆI kod (učionicu) — odvojeno od Grad/Škola
+        # podešavanja. Koristi se kad neko drugi (ili isti profesor ponovo)
+        # želi da se prijavi na OVOM računaru bez da mijenja/napušta školu.
+        elif path == "/prijava_profesora":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            ime_prezime = str(data.get("ime_prezime", "")).strip()
+            licna_sifra = str(data.get("licna_sifra", ""))
+            if not kod or not ime_prezime or not licna_sifra:
+                self._json({"greska": "Nedostaje kod, ime/prezime ili lična šifra"}, 400)
+                return
+            try:
+                with _db_lock, _db_konekcija() as konn:
+                    konn.row_factory = sqlite3.Row
+                    red = konn.execute(
+                        "SELECT skolski_kod FROM ucionice WHERE kod = ?", (kod,)).fetchone()
+                skolski_kod = (red["skolski_kod"] if red else "") or ""
+                profesor_id, greska = _db_prijava_profesora(skolski_kod, ime_prezime, licna_sifra)
+                if greska:
+                    self._json({"greska": greska}, 403)
+                    return
+                _db_poveži_profesora_kodom(kod, profesor_id, ime_prezime)
+                self._json({"status": "ok"})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
+
         # Nastavnik pravi NOVU dijeljenu školu (instituciju) — generiše se
         # skolski_kod koji se daje kolegama da se pridruže istoj istoriji.
         # Svaki nastavnik MORA prijaviti ime/prezime i ličnu šifru — ta lična
