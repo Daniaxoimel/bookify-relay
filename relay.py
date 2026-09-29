@@ -233,6 +233,7 @@ def _db_init():
             "ALTER TABLE ucionice ADD COLUMN profesor_id TEXT DEFAULT ''",
             "ALTER TABLE ucionice ADD COLUMN profesor_ime TEXT DEFAULT ''",
             "ALTER TABLE verzije ADD COLUMN sha256 TEXT DEFAULT ''",
+            "ALTER TABLE verzije ADD COLUMN potpis TEXT DEFAULT ''",
         ):
             try:
                 konn.execute(_alter)
@@ -266,16 +267,16 @@ def _uporedi_verzije(v1, v2):
     return 0
 
 
-def _db_objavi_verziju(app, verzija, sadrzaj_b64, napomene="", sha256=""):
+def _db_objavi_verziju(app, verzija, sadrzaj_b64, napomene="", sha256="", potpis=""):
     with _db_lock, _db_konekcija() as konn:
         konn.execute("""
-            INSERT INTO verzije (app, verzija, sadrzaj_b64, sha256, napomene, objavljeno)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO verzije (app, verzija, sadrzaj_b64, sha256, potpis, napomene, objavljeno)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(app) DO UPDATE SET
                 verzija = excluded.verzija, sadrzaj_b64 = excluded.sadrzaj_b64,
-                sha256 = excluded.sha256,
+                sha256 = excluded.sha256, potpis = excluded.potpis,
                 napomene = excluded.napomene, objavljeno = excluded.objavljeno
-        """, (app, verzija, sadrzaj_b64, sha256 or "", napomene or "",
+        """, (app, verzija, sadrzaj_b64, sha256 or "", potpis or "", napomene or "",
               datetime.now().isoformat(timespec="seconds")))
 
 
@@ -291,7 +292,7 @@ def _db_preuzmi_verziju(app):
     with _db_lock, _db_konekcija() as konn:
         konn.row_factory = sqlite3.Row
         return konn.execute(
-            "SELECT verzija, sadrzaj_b64, sha256 FROM verzije WHERE app = ?", (app,)
+            "SELECT verzija, sadrzaj_b64, sha256, potpis FROM verzije WHERE app = ?", (app,)
         ).fetchone()
 
 
@@ -958,7 +959,8 @@ class RelayHandler(BaseHTTPRequestHandler):
                     self._json({"greska": "Nema objavljene verzije za taj program."}, 404)
                     return
                 self._json({"verzija": red["verzija"], "sadrzaj_b64": red["sadrzaj_b64"],
-                            "sha256": red["sha256"] or ""})
+                            "sha256": red["sha256"] or "",
+                            "potpis": red["potpis"] or ""})
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
 
@@ -996,6 +998,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                     "preskocene_promjene": data.get("preskocene_promjene", []),
                     "zadnji_update": data.get("zadnji_update", ""),
                     "state":         data.get("state", {}),
+                    "sesija_id":     data.get("sesija_id", ""),
                     "ip":            ucenik_id,
                     "vrijeme":       time.time(),
                 }
@@ -1062,7 +1065,15 @@ class RelayHandler(BaseHTTPRequestHandler):
         # POST /admin/objavi_update {app, verzija, sadrzaj_b64, admin_sifra, napomene}
         elif path == "/admin/objavi_update":
             admin_sifra = str(data.get("admin_sifra", ""))
-            if admin_sifra != ADMIN_SIFRA:
+            # Ako šifra nije postavljena na serveru (ostala zadana), objava je
+            # potpuno zabranjena — inače bi svako ko zna zadanu vrijednost mogao objaviti.
+            if ADMIN_SIFRA in ("", "PROMIJENI_OVU_SIFRU"):
+                self._json({"greska": "Admin šifra nije postavljena na serveru "
+                                       "(environment varijabla RELAY_ADMIN_SIFRA)."}, 403)
+                return
+            import hmac as _hmac_a
+            if not _hmac_a.compare_digest(admin_sifra.encode("utf-8"),
+                                          ADMIN_SIFRA.encode("utf-8")):
                 self._json({"greska": "Pogrešna admin šifra."}, 403)
                 return
             app = str(data.get("app", "")).strip()
@@ -1070,6 +1081,11 @@ class RelayHandler(BaseHTTPRequestHandler):
             sadrzaj_b64 = data.get("sadrzaj_b64", "")
             napomene = str(data.get("napomene", ""))
             sha256 = str(data.get("sha256", ""))
+            potpis = str(data.get("potpis", "")).strip()
+            if not potpis:
+                self._json({"greska": "Update mora biti potpisan (nedostaje potpis). "
+                                       "Koristi novu verziju publish_update.py."}, 400)
+                return
             if app not in ("bookify", "profesori") or not verzija or not sadrzaj_b64:
                 self._json({"greska": "Nedostaje app, verzija ili sadržaj."}, 400)
                 return
@@ -1083,7 +1099,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                         self._json({"greska": "Otisak (sha256) se ne poklapa — upload "
                                                "je vjerovatno prekinut/oštećen. Pokušaj ponovo."}, 400)
                         return
-                _db_objavi_verziju(app, verzija, sadrzaj_b64, napomene, sha256)
+                _db_objavi_verziju(app, verzija, sadrzaj_b64, napomene, sha256, potpis)
                 self._json({"status": "ok", "app": app, "verzija": verzija})
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
