@@ -785,6 +785,19 @@ def _db_sacuvaj_rad(kod, ucenik_ime, razred, promet_dug, promet_pot,
         return cur.lastrowid
 
 
+def _db_postavi_zavrsio_rada(kod, rad_id, zavrsio):
+    """Profesor u formativnom praćenju mijenja da/ne "završio" za JEDAN
+    sačuvani rad — i dugo nakon časa. Dozvoljeno samo za radove iz kodova
+    koje taj profesor/škola vidi."""
+    with _db_lock, _db_konekcija() as konn:
+        kodovi, _ = _kodovi_za_upit(konn, kod)
+        upitnici = ",".join("?" * len(kodovi))
+        cur = konn.execute(
+            f"UPDATE radovi SET zavrsio = ? WHERE id = ? AND kod IN ({upitnici})",
+            [1 if zavrsio else 0, int(rad_id)] + kodovi)
+        return cur.rowcount
+
+
 def _db_postavi_rucni_zavrsio(kod, ucenik_id, zavrsio):
     """Profesor ručno postavlja da li je učenik završio rad ili ne."""
     with _db_lock, _db_konekcija() as konn:
@@ -1338,6 +1351,23 @@ class RelayHandler(BaseHTTPRequestHandler):
             with lock:
                 oznake[f"{kod}|{ucenik_id}"] = {"lista": lista, "vrijeme": time.time()}
             self._json({"status": "ok"})
+
+        # Formativno praćenje: da/ne "završio" za jedan SAČUVANI rad.
+        # POST /postavi_zavrsio_rad {classroom_kod, rad_id, zavrsio}
+        elif path == "/postavi_zavrsio_rad":
+            kod = str(data.get("classroom_kod", "")).strip().upper()
+            rad_id = data.get("rad_id")
+            if not kod or rad_id in (None, ""):
+                self._json({"greska": "Nedostaje kod ili rad_id"}, 400)
+                return
+            try:
+                promijenjeno = _db_postavi_zavrsio_rada(kod, rad_id, bool(data.get("zavrsio")))
+                if not promijenjeno:
+                    self._json({"greska": "Rad nije pronađen."}, 404)
+                    return
+                self._json({"status": "ok"})
+            except Exception as e:
+                self._json({"greska": f"Greška baze: {e}"}, 500)
 
         # Profesor ručno postavlja da li je učenik završio rad: POST /postavi_zavrsio
         # {classroom_kod, ucenik_id, zavrsio} — ako je "zavrsio" None/izostavljen,
