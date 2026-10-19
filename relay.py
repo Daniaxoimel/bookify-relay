@@ -91,11 +91,135 @@ def _snapshot_sacuvaj():
 # se INSERT reda ovdje — ništa se ne briše niti prepisuje, pa se kroz vrijeme
 # gradi istorija za praćenje napretka.
 
-_db_lock = threading.Lock()
+# RLock (a ne obični Lock): neke funkcije drže bravu i zovu drugu funkciju
+# koja je opet uzima (npr. _provjeri_sifru -> _provjeri_licnu_sifru_profesora).
+# Sa običnim Lock-om server bi se tu zauvijek "zaledio" (brisanje radova).
+_db_lock = threading.RLock()
+
+# ── Gdje su podaci ──────────────────────────────────────────────────────────
+# Ako je na serveru postavljena varijabla DATABASE_URL (link Neon / Postgres
+# baze), SVE se čuva tamo — trajno, i kad se besplatni Render ugasi ili
+# redeploya. Ako nije postavljena, koristi se lokalni SQLite fajl kao ranije
+# (dobro za testiranje na svom računaru, ali na besplatnom Renderu se briše).
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+KORISTI_POSTGRES = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+
+
+class _Red:
+    """Red rezultata — radi i kao r[0] i kao r["kolona"] i dict(r), isto kao
+    sqlite3.Row, da ostatak koda ne mora znati koja je baza ispod."""
+    __slots__ = ("_kljucevi", "_vrijednosti")
+
+    def __init__(self, kljucevi, vrijednosti):
+        self._kljucevi = kljucevi
+        self._vrijednosti = vrijednosti
+
+    def __getitem__(self, k):
+        if isinstance(k, int):
+            return self._vrijednosti[k]
+        return self._vrijednosti[self._kljucevi.index(k)]
+
+    def keys(self):
+        return list(self._kljucevi)
+
+    def __len__(self):
+        return len(self._vrijednosti)
+
+    def __iter__(self):
+        return iter(self._vrijednosti)
+
+
+class _PgKursor:
+    def __init__(self, redovi=None, rowcount=-1, lastrowid=None):
+        self._redovi = redovi or []
+        self.rowcount = rowcount
+        self.lastrowid = lastrowid
+
+    def fetchone(self):
+        return self._redovi[0] if self._redovi else None
+
+    def fetchall(self):
+        return list(self._redovi)
+
+
+class _PgKonekcija:
+    """Tanki omotač oko psycopg konekcije koji prima isti SQL kao SQLite
+    (upitnici '?', AUTOINCREMENT, REAL...) i prevodi ga za Postgres."""
+    row_factory = None  # postoji samo da 'konn.row_factory = ...' ne pukne
+
+    def __init__(self):
+        self._konn = None
+
+    def _otvori(self):
+        import psycopg
+        if self._konn is None or self._konn.closed:
+            self._konn = psycopg.connect(DATABASE_URL, autocommit=True,
+                                         connect_timeout=15,
+                                         prepare_threshold=None)  # radi i s Neon "pooled" linkom
+        return self._konn
+
+    @staticmethod
+    def _prevedi(sql):
+        s = sql.strip()
+        gore = s.upper()
+        if gore.startswith("PRAGMA"):
+            return None
+        if gore.startswith("CREATE TABLE"):
+            s = s.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+            s = s.replace(" REAL", " DOUBLE PRECISION")
+        if gore.startswith("ALTER TABLE") and "ADD COLUMN IF NOT EXISTS" not in gore:
+            s = s.replace("ADD COLUMN", "ADD COLUMN IF NOT EXISTS", 1)
+        if gore.startswith("INSERT INTO RADOVI") and "RETURNING" not in gore:
+            s += " RETURNING id"
+        return s.replace("%", "%%").replace("?", "%s")
+
+    @staticmethod
+    def _cisto(v):
+        from decimal import Decimal
+        return float(v) if isinstance(v, Decimal) else v
+
+    def execute(self, sql, params=()):
+        pg_sql = self._prevedi(sql)
+        if pg_sql is None:
+            return _PgKursor()
+        import psycopg
+        for pokusaj in (1, 2):
+            try:
+                with self._otvori().cursor() as cur:
+                    cur.execute(pg_sql, list(params))
+                    redovi = []
+                    if cur.description:
+                        kljucevi = [d.name for d in cur.description]
+                        redovi = [_Red(kljucevi, [self._cisto(v) for v in r])
+                                  for r in cur.fetchall()]
+                    lastrowid = redovi[0][0] if ("RETURNING id" in pg_sql and redovi) else None
+                    return _PgKursor(redovi, cur.rowcount, lastrowid)
+            except psycopg.OperationalError:
+                # Neon "zaspi" nakon par minuta bez rada i prekine vezu —
+                # otvori novu i probaj još jednom.
+                try:
+                    if self._konn is not None:
+                        self._konn.close()
+                except Exception:
+                    pass
+                self._konn = None
+                if pokusaj == 2:
+                    raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+_pg_konekcija = _PgKonekcija() if KORISTI_POSTGRES else None
 
 
 def _db_konekcija():
-    konn = sqlite3.connect(DB_FILE, timeout=10)
+    if KORISTI_POSTGRES:
+        return _pg_konekcija
+    konn = sqlite3.connect(DB_FILE, timeout=10, check_same_thread=False)
     konn.execute("PRAGMA journal_mode=WAL")  # bolje podnosi paralelne upise
     return konn
 
@@ -828,8 +952,8 @@ def _db_statistika(kod):
                    MAX(vrijeme)          AS poslednji_put,
                    SUM(zavrsio)          AS broj_zavrsenih
             FROM radovi WHERE kod IN ({upitnici})
-            GROUP BY razred, ucenik_ime
-            ORDER BY razred ASC, poslednji_put DESC
+            GROUP BY 1, ucenik_ime
+            ORDER BY 1 ASC, poslednji_put DESC
         """, kodovi).fetchall()
 
         ident = skolski_kod or kod
@@ -927,8 +1051,9 @@ class RelayHandler(BaseHTTPRequestHandler):
                     broj_prof = konn.execute("SELECT COUNT(*) FROM profesori").fetchone()[0]
             except Exception:
                 broj_radova = broj_prof = -1
-            self._json({"status": "ok", "relay": "Bookify Relay v3.2",
-                        "baza": os.path.abspath(DB_FILE),
+            self._json({"status": "ok", "relay": "Bookify Relay v3.3",
+                        "baza": ("Postgres (DATABASE_URL) — trajno" if KORISTI_POSTGRES
+                                 else os.path.abspath(DB_FILE) + " — SQLite"),
                         "server_pokrenut": SERVER_POKRENUT,
                         "radova_u_bazi": broj_radova,
                         "profesora_u_bazi": broj_prof})
@@ -1520,9 +1645,12 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _na_gasenje)
     threading.Thread(target=_cisti, daemon=True).start()
     threading.Thread(target=_snapshotuj_periodicno, daemon=True).start()
-    print(f"Bookify Relay v3.2 pokrenut na portu {port}")
-    print(f"Baza: {os.path.abspath(DB_FILE)}")
-    if "RELAY_DB" not in os.environ:
+    print(f"Bookify Relay v3.3 pokrenut na portu {port}")
+    if KORISTI_POSTGRES:
+        print("Baza: Postgres (DATABASE_URL) — podaci su trajni.")
+    else:
+        print(f"Baza: {os.path.abspath(DB_FILE)} (SQLite)")
+    if not KORISTI_POSTGRES and "RELAY_DB" not in os.environ:
         print("⚠  RELAY_DB nije postavljen — baza je u folderu aplikacije. Na Renderu "
               "BEZ persistent diska ovaj folder se BRIŠE pri svakom restartu/redeployu!")
     try:
