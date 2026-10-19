@@ -489,6 +489,38 @@ def _db_nadji_profesora_bilo_gdje(ime_prezime, sifra):
     return None, ""
 
 
+def _db_profesor_za_skolu(skolski_kod, ime_prezime, sifra):
+    """Vrati profesora za datu školu TAKO DA OSTANE ISTA OSOBA: ako profesor
+    s tim imenom i šifrom već postoji (u bilo kojoj školi ili solo), samo se
+    premjesti u novu školu — ne pravi se novi (duplikat) profil, pa njegovi
+    raniji kodovi/radovi ostaju njegovi. Vraća (profesor_id, None) ili
+    (None, poruka_greske)."""
+    ime_prezime = (ime_prezime or "").strip()
+    if not ime_prezime or not sifra:
+        return None, "Ime i prezime i lična šifra su obavezni."
+    postojeci_id, _ = _db_nadji_profesora_bilo_gdje(ime_prezime, sifra)
+    if not postojeci_id:
+        return _db_prijava_profesora(skolski_kod, ime_prezime, sifra)
+    novi_hash = _upisi_hash(f"prof:{skolski_kod or ''}:{ime_prezime}", sifra)
+    with _db_lock, _db_konekcija() as konn:
+        konn.row_factory = sqlite3.Row
+        u_cilju = konn.execute(
+            "SELECT profesor_id, sifra_hash FROM profesori WHERE skolski_kod = ? AND ime_prezime = ?",
+            (skolski_kod or "", ime_prezime)).fetchone()
+        if u_cilju and u_cilju["profesor_id"] != postojeci_id:
+            if u_cilju["sifra_hash"] != novi_hash:
+                return None, ("U toj školi već postoji profesor s tim imenom (druga šifra). "
+                              "Koristi malo drugačije ime, npr. sa srednjim slovom.")
+            # Isti čovjek ima dva profila — spoji ih u jedan.
+            konn.execute("UPDATE ucionice SET profesor_id = ? WHERE profesor_id = ?",
+                         (u_cilju["profesor_id"], postojeci_id))
+            konn.execute("DELETE FROM profesori WHERE profesor_id = ?", (postojeci_id,))
+            return u_cilju["profesor_id"], None
+        konn.execute("UPDATE profesori SET skolski_kod = ?, sifra_hash = ? WHERE profesor_id = ?",
+                     (skolski_kod or "", novi_hash, postojeci_id))
+        return postojeci_id, None
+
+
 def _db_vrati_kod_u_skolu(kod, skolski_kod):
     """Kod (učionicu) pridruži školi u kojoj je profesor već registrovan."""
     with _db_lock, _db_konekcija() as konn:
@@ -1477,7 +1509,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                 return
             try:
                 skolski_kod = _db_napravi_instituciju(kod, grad, skola, sifra)
-                profesor_id, greska = _db_prijava_profesora(skolski_kod, ime_prezime, licna_sifra)
+                profesor_id, greska = _db_profesor_za_skolu(skolski_kod, ime_prezime, licna_sifra)
                 if greska:
                     self._json({"greska": greska}, 403)
                     return
@@ -1506,7 +1538,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                 if not uspjeh:
                     self._json({"greska": "Školski kod ili šifra nisu ispravni."}, 403)
                     return
-                profesor_id, greska = _db_prijava_profesora(skolski_kod, ime_prezime, licna_sifra)
+                profesor_id, greska = _db_profesor_za_skolu(skolski_kod, ime_prezime, licna_sifra)
                 if greska:
                     self._json({"greska": greska}, 403)
                     return
@@ -1523,6 +1555,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                 return
             try:
                 _db_napusti_skolu(kod)
+                ime_prezime = str(data.get("ime_prezime", "")).strip()
+                licna_sifra = str(data.get("licna_sifra", ""))
+                if ime_prezime and licna_sifra:
+                    profesor_id, greska = _db_profesor_za_skolu("", ime_prezime, licna_sifra)
+                    if profesor_id:
+                        _db_poveži_profesora_kodom(kod, profesor_id, ime_prezime)
                 self._json({"status": "ok"})
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
