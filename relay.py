@@ -32,7 +32,13 @@ SNAPSHOT_FILE = os.environ.get("RELAY_SNAPSHOT", "relay_state.json")
 # Šifra za objavljivanje update-a programa (bookify.py / profesori.py) —
 # SAMO ti (developer) treba da je znaš. Promijeni ovo prije puštanja u rad,
 # ili je postavi kao environment varijablu RELAY_ADMIN_SIFRA na serveru.
-ADMIN_SIFRA = os.environ.get("RELAY_ADMIN_SIFRA", "PROMIJENI_OVU_SIFRU")
+ADMIN_SIFRA = os.environ.get("RELAY_ADMIN_SIFRA", "PROMIJENI_OVU_SIFRU").strip()
+
+
+def _otisak_sifre(sifra):
+    """Kratak otisak šifre za provjeru u /ping — iz njega se šifra ne može
+    pogoditi, ali se vidi da li server i publish_update.py imaju ISTU šifru."""
+    return hashlib.sha256(sifra.encode("utf-8")).hexdigest()[:6]
 
 # Trajna baza (radovi/rezultati učenika) — odvojena od gornjeg efemernog stanja.
 # Isti disk kao i SNAPSHOT_FILE (npr. Render persistent disk), pa preživljava restart.
@@ -1101,7 +1107,9 @@ class RelayHandler(BaseHTTPRequestHandler):
                                  else os.path.abspath(DB_FILE) + " — SQLite"),
                         "server_pokrenut": SERVER_POKRENUT,
                         "radova_u_bazi": broj_radova,
-                        "profesora_u_bazi": broj_prof})
+                        "profesora_u_bazi": broj_prof,
+                        "admin_sifra": {"duzina": len(ADMIN_SIFRA),
+                                        "otisak": _otisak_sifre(ADMIN_SIFRA)}})
 
         elif path == "/status":
             with lock:
@@ -1300,7 +1308,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         # — SAMO ti (developer) treba da koristiš ovo, sa svojom ADMIN_SIFRA.
         # POST /admin/objavi_update {app, verzija, sadrzaj_b64, admin_sifra, napomene}
         elif path == "/admin/objavi_update":
-            admin_sifra = str(data.get("admin_sifra", ""))
+            admin_sifra = str(data.get("admin_sifra", "")).strip()
             # Ako šifra nije postavljena na serveru (ostala zadana), objava je
             # potpuno zabranjena — inače bi svako ko zna zadanu vrijednost mogao objaviti.
             if ADMIN_SIFRA in ("", "PROMIJENI_OVU_SIFRU"):
