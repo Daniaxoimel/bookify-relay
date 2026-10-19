@@ -37,6 +37,7 @@ ADMIN_SIFRA = os.environ.get("RELAY_ADMIN_SIFRA", "PROMIJENI_OVU_SIFRU")
 # Trajna baza (radovi/rezultati učenika) — odvojena od gornjeg efemernog stanja.
 # Isti disk kao i SNAPSHOT_FILE (npr. Render persistent disk), pa preživljava restart.
 DB_FILE = os.environ.get("RELAY_DB", "relay_podaci.db")
+SERVER_POKRENUT = datetime.now().isoformat(timespec="seconds")
 
 # sobe:    {kod: {ucenik_id: {podaci..., "vrijeme": ts}}}
 # zadaci:  {(kod, ucenik_id_ili_None): {"tekst":.., "tip":.., "vrijeme": ts}}
@@ -328,10 +329,57 @@ def _db_prijava_profesora(skolski_kod, ime_prezime, sifra):
 
 
 def _db_poveži_profesora_kodom(kod, profesor_id, ime_prezime):
+    # UPSERT: ranije je ovdje bio samo UPDATE, pa se na NOVOM računaru (kod
+    # koji još nema red u 'ucionice') profesor uopšte nije povezao s kodom —
+    # i istorija ga nije "pratila" s jednog računara na drugi.
     with _db_lock, _db_konekcija() as konn:
-        konn.execute(
-            "UPDATE ucionice SET profesor_id = ?, profesor_ime = ? WHERE kod = ?",
-            (profesor_id or "", ime_prezime or "", kod))
+        konn.execute("""
+            INSERT INTO ucionice (kod, profesor_id, profesor_ime, azurirano)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(kod) DO UPDATE SET profesor_id = excluded.profesor_id,
+                                            profesor_ime = excluded.profesor_ime,
+                                            azurirano = excluded.azurirano
+        """, (kod, profesor_id or "", ime_prezime or "",
+              datetime.now().isoformat(timespec="seconds")))
+
+
+def _db_nadji_profesora_bilo_gdje(ime_prezime, sifra):
+    """Traži postojećeg profesora po imenu i ličnoj šifri u SVIM školama
+    (i solo). Koristi se kad se profesor prijavljuje na računaru koji još
+    nije povezan ni sa jednom školom — npr. drugi računar, ili isti računar
+    nakon što mu je obrisan %APPDATA% (Deep Freeze, novi Windows profil...),
+    pa je program napravio NOVI kod učionice.
+    Vraća (profesor_id, skolski_kod) ili (None, "")."""
+    ime_prezime = (ime_prezime or "").strip()
+    if not ime_prezime or not sifra:
+        return None, ""
+    with _db_lock, _db_konekcija() as konn:
+        konn.row_factory = sqlite3.Row
+        redovi = konn.execute(
+            "SELECT profesor_id, skolski_kod, sifra_hash FROM profesori WHERE ime_prezime = ?",
+            (ime_prezime,)).fetchall()
+    for r in redovi:
+        sk = r["skolski_kod"] or ""
+        if _upisi_hash(f"prof:{sk}:{ime_prezime}", sifra) == r["sifra_hash"]:
+            return r["profesor_id"], sk
+    return None, ""
+
+
+def _db_vrati_kod_u_skolu(kod, skolski_kod):
+    """Kod (učionicu) pridruži školi u kojoj je profesor već registrovan."""
+    with _db_lock, _db_konekcija() as konn:
+        konn.row_factory = sqlite3.Row
+        inst = konn.execute(
+            "SELECT grad, skola FROM institucije WHERE skolski_kod = ?",
+            (skolski_kod,)).fetchone()
+        if not inst:
+            return "", ""
+        konn.execute("""
+            UPDATE ucionice SET skolski_kod = ?, grad = ?, skola = ?, azurirano = ?
+            WHERE kod = ?
+        """, (skolski_kod, inst["grad"], inst["skola"],
+              datetime.now().isoformat(timespec="seconds"), kod))
+        return inst["grad"], inst["skola"]
 
 
 def _kodovi_profesora(konn, kod):
@@ -377,15 +425,22 @@ def _povezanost_koda(konn, kod):
 
 
 def _kodovi_za_upit(konn, kod):
-    """Skup kodova preko kojih treba tražiti radove za dati kod — ako je kod
-    dio dijeljene institucije, to su SVI kodovi te institucije; inače samo taj
-    jedan (solo način rada, kao i prije)."""
+    """Skup kodova preko kojih treba tražiti radove za dati kod:
+    - sam taj kod,
+    - SVI kodovi istog profesora (njegovi drugi računari / stari kodovi
+      nakon reinstalacije ili brisanja %APPDATA%) — zato radovi ne "nestanu"
+      kad se profesor odjavi i ponovo prijavi na drugom kodu,
+    - ako je kod dio dijeljene škole, i svi kodovi te škole."""
     red = _povezanost_koda(konn, kod)
     skolski_kod = (red["skolski_kod"] if red else "") or ""
+    profesor_id = (red["profesor_id"] if red else "") or ""
+    kodovi = {kod}
     if skolski_kod:
-        kodovi = _kodovi_institucije(konn, skolski_kod)
-        return kodovi or [kod], skolski_kod
-    return [kod], ""
+        kodovi.update(_kodovi_institucije(konn, skolski_kod))
+    if profesor_id:
+        kodovi.update(r[0] for r in konn.execute(
+            "SELECT kod FROM ucionice WHERE profesor_id = ?", (profesor_id,)).fetchall())
+    return sorted(kodovi), skolski_kod
 
 
 def _provjeri_sifru(kod, sifra):
@@ -641,11 +696,13 @@ def _db_greske(kod, ucenik_id=None, ucenik_ime=None):
             return [{"datum": r[0], "redni_broj_promjene": r[1],
                      "oblast": r[2], "tip": r[3]} for r in redovi]
         if ucenik_ime:
-            redovi = konn.execute("""
+            kodovi, _ = _kodovi_za_upit(konn, kod)
+            upitnici = ",".join("?" * len(kodovi))
+            redovi = konn.execute(f"""
                 SELECT datum, redni_broj_promjene, oblast, tip
-                FROM greske_log WHERE kod = ? AND ucenik_ime = ?
+                FROM greske_log WHERE kod IN ({upitnici}) AND ucenik_ime = ?
                 ORDER BY id DESC
-            """, (kod, ucenik_ime)).fetchall()
+            """, kodovi + [ucenik_ime]).fetchall()
             return [{"datum": r[0], "redni_broj_promjene": r[1],
                      "oblast": r[2], "tip": r[3]} for r in redovi]
         redovi = konn.execute("""
@@ -751,14 +808,13 @@ def _db_statistika(kod):
             grad  = inst["grad"]  if inst else (red["grad"] if red else "")
             skola = inst["skola"] if inst else (red["skola"] if red else "")
             sifra_postavljena = bool(inst["sifra_hash"]) if inst else False
-            kodovi = _kodovi_institucije(konn, skolski_kod) or [kod]
-            broj_nastavnika = len(kodovi)
+            broj_nastavnika = len(_kodovi_institucije(konn, skolski_kod) or [kod])
         else:
             grad  = red["grad"]  if red else ""
             skola = red["skola"] if red else ""
             sifra_postavljena = bool(red["sifra_hash"]) if red else False
-            kodovi = [kod]
             broj_nastavnika = 1
+        kodovi, _ = _kodovi_za_upit(konn, kod)
 
         upitnici = ",".join("?" * len(kodovi))
         ukupno = konn.execute(
@@ -865,7 +921,17 @@ class RelayHandler(BaseHTTPRequestHandler):
                         "oblast": z.get("oblast", ""), "broj_promjena": z.get("broj_promjena")})
 
         elif path == "/ping":
-            self._json({"status": "ok", "relay": "Bookify Relay v3.0"})
+            try:
+                with _db_lock, _db_konekcija() as konn:
+                    broj_radova = konn.execute("SELECT COUNT(*) FROM radovi").fetchone()[0]
+                    broj_prof = konn.execute("SELECT COUNT(*) FROM profesori").fetchone()[0]
+            except Exception:
+                broj_radova = broj_prof = -1
+            self._json({"status": "ok", "relay": "Bookify Relay v3.2",
+                        "baza": os.path.abspath(DB_FILE),
+                        "server_pokrenut": SERVER_POKRENUT,
+                        "radova_u_bazi": broj_radova,
+                        "profesora_u_bazi": broj_prof})
 
         elif path == "/status":
             with lock:
@@ -1245,12 +1311,24 @@ class RelayHandler(BaseHTTPRequestHandler):
                     red = konn.execute(
                         "SELECT skolski_kod FROM ucionice WHERE kod = ?", (kod,)).fetchone()
                 skolski_kod = (red["skolski_kod"] if red else "") or ""
-                profesor_id, greska = _db_prijava_profesora(skolski_kod, ime_prezime, licna_sifra)
-                if greska:
-                    self._json({"greska": greska}, 403)
-                    return
+                grad = skola = ""
+                profesor_id = None
+                if not skolski_kod:
+                    # Nov / "prazan" računar: probaj naći već postojećeg
+                    # profesora (s njegovom školom) po imenu i ličnoj šifri.
+                    profesor_id, nadjen_sk = _db_nadji_profesora_bilo_gdje(ime_prezime, licna_sifra)
+                    if profesor_id and nadjen_sk:
+                        skolski_kod = nadjen_sk
+                if not profesor_id:
+                    profesor_id, greska = _db_prijava_profesora(skolski_kod, ime_prezime, licna_sifra)
+                    if greska:
+                        self._json({"greska": greska}, 403)
+                        return
                 _db_poveži_profesora_kodom(kod, profesor_id, ime_prezime)
-                self._json({"status": "ok"})
+                if skolski_kod and not (red and red["skolski_kod"]):
+                    grad, skola = _db_vrati_kod_u_skolu(kod, skolski_kod)
+                self._json({"status": "ok", "skolski_kod": skolski_kod,
+                            "grad": grad, "skola": skola})
             except Exception as e:
                 self._json({"greska": f"Greška baze: {e}"}, 500)
 
@@ -1442,7 +1520,11 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, _na_gasenje)
     threading.Thread(target=_cisti, daemon=True).start()
     threading.Thread(target=_snapshotuj_periodicno, daemon=True).start()
-    print(f"Bookify Relay v3.0 pokrenut na portu {port}")
+    print(f"Bookify Relay v3.2 pokrenut na portu {port}")
+    print(f"Baza: {os.path.abspath(DB_FILE)}")
+    if "RELAY_DB" not in os.environ:
+        print("⚠  RELAY_DB nije postavljen — baza je u folderu aplikacije. Na Renderu "
+              "BEZ persistent diska ovaj folder se BRIŠE pri svakom restartu/redeployu!")
     try:
         ThreadingHTTPServer(("0.0.0.0", port), RelayHandler).serve_forever()
     except KeyboardInterrupt:
